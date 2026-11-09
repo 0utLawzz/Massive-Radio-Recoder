@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Download, Headphones, Play, Radio, Trash2 } from "lucide-react";
+import { Download, Headphones, Play, Trash2 } from "lucide-react";
 import { canPickSaveFile, pickSaveFile, startCapture, type CaptureReason } from "@/lib/capture";
 import { downloadBlob, formatBytes, formatDuration, recordingName } from "@/lib/format";
 import { deleteTake, getTakeBlob, listTakes, saveTake, type TakeMeta, type TrackMark } from "@/lib/library";
@@ -35,7 +35,7 @@ type Graph = {
   analyser: AnalyserNode;
 };
 
-const LARGE_TAKE = 150 * 1024 * 1024;
+const _LARGE_TAKE = 150 * 1024 * 1024;
 
 function attachAnalyser(audio: HTMLAudioElement): Graph | null {
   const tagged = audio as HTMLAudioElement & { __graph?: Graph };
@@ -554,3 +554,264 @@ export function Deck() {
         </div>
 
         <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              onClick={() => void onListen()}
+              className={`inline-flex items-center gap-2 rounded-full border px-4 py-2 font-display text-sm tracking-wider uppercase transition-colors ${
+                listening
+                  ? "border-cyan bg-cyan/20 text-cyan"
+                  : "border-line bg-surface hover:border-muted text-fg"
+              }`}
+            >
+              <Headphones className="h-4 w-4" />
+              <span>{listening ? "Mute Stream" : "Listen Live"}</span>
+            </button>
+
+            <div className="flex items-center gap-2">
+              <input
+                type="range"
+                min="0"
+                max="1"
+                step="0.05"
+                value={volume}
+                onChange={(e) => onVolume(parseFloat(e.target.value))}
+                className="h-1.5 w-20 sm:w-24 accent-cyan cursor-pointer"
+                aria-label="Volume"
+              />
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="flex items-center gap-1.5 text-xs text-muted">
+              <span>Timer:</span>
+              {LIMITS.map((lim) => (
+                <button
+                  key={lim.id}
+                  type="button"
+                  disabled={recording}
+                  onClick={() => setLimitId(lim.id)}
+                  className={`rounded px-2 py-1 transition-colors ${
+                    limitId === lim.id
+                      ? "bg-cyan text-bg font-semibold"
+                      : "border border-line hover:border-muted text-muted"
+                  }`}
+                >
+                  {lim.label}
+                </button>
+              ))}
+            </div>
+
+            <label className="flex items-center gap-2 text-xs text-muted cursor-pointer">
+              <input
+                type="checkbox"
+                checked={monitor}
+                disabled={recording}
+                onChange={(e) => setMonitor(e.target.checked)}
+                className="rounded border-line text-cyan focus:ring-0"
+              />
+              <span>Monitor while recording</span>
+            </label>
+
+            {canDirect && (
+              <label className="flex items-center gap-2 text-xs text-muted cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={saveDirect}
+                  disabled={recording}
+                  onChange={(e) => setSaveDirect(e.target.checked)}
+                  className="rounded border-line text-cyan focus:ring-0"
+                />
+                <span>Direct Save</span>
+              </label>
+            )}
+          </div>
+        </div>
+
+        {recording && (
+          <div className="mt-4 flex items-center justify-between rounded-lg bg-bg/60 px-4 py-2.5 text-sm">
+            <div className="flex items-center gap-2">
+              <span className="h-2.5 w-2.5 rounded-full bg-record animate-pulse" />
+              <span className="font-display tracking-wider text-record">RECORDING</span>
+              <span className="text-fg font-mono">{formatDuration(elapsed)}</span>
+              {remaining !== null && (
+                <span className="text-muted text-xs">({formatDuration(remaining)} left)</span>
+              )}
+            </div>
+            <div className="text-xs font-mono text-cyan">{formatBytes(bytes)}</div>
+          </div>
+        )}
+      </section>
+
+      {shownTracks.length > 0 && (
+        <div className="rounded-card border border-line bg-surface/50 p-4">
+          <p className="font-display text-xs tracking-widest text-muted uppercase">Announced Tracks in this Take</p>
+          <ul className="mt-2 space-y-1 text-sm">
+            {shownTracks.map((track, i) => (
+              <li key={i} className="flex items-center justify-between text-muted">
+                <span className="text-fg truncate">{track.title}</span>
+                <span className="font-mono text-xs text-muted ml-2">{formatDuration(track.t)}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {error && (
+        <div className="rounded-card border border-record/40 bg-record/10 p-4 text-sm text-record">
+          {error}
+        </div>
+      )}
+
+      {notice && (
+        <div className="rounded-card border border-cyan/40 bg-cyan/10 p-4 text-sm text-cyan">
+          {notice}
+        </div>
+      )}
+
+      {pending && (
+        <section className="rounded-card border-2 border-cyan bg-surface p-5">
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+            <div>
+              <p className="font-display text-xs tracking-widest text-cyan uppercase">Take Ready</p>
+              <h3 className="text-lg font-display text-fg mt-1">
+                {pending.stationName} · {formatDuration(pending.endedAt - pending.startedAt)} ({formatBytes(pending.bytes)})
+              </h3>
+              <p className="text-sm text-muted mt-1">{reasonCopy(pending.reason, pending.fileSaved)}</p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              {!pending.fileSaved && (
+                <>
+                  <button
+                    type="button"
+                    onClick={onDownload}
+                    className="inline-flex items-center gap-1.5 rounded-full bg-cyan px-4 py-2 text-sm font-semibold text-bg transition-opacity hover:opacity-90"
+                  >
+                    <Download className="h-4 w-4" />
+                    <span>Save MP3</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void onKeep()}
+                    disabled={pending.kept}
+                    className="inline-flex items-center gap-1.5 rounded-full border border-line px-4 py-2 text-sm font-semibold text-fg transition-colors hover:border-muted disabled:opacity-50"
+                  >
+                    <span>{pending.kept ? "Saved in Browser" : "Keep in Browser"}</span>
+                  </button>
+                </>
+              )}
+              {pending.tracks.length > 0 && (
+                <button
+                  type="button"
+                  onClick={onCueSheet}
+                  className="inline-flex items-center gap-1.5 rounded-full border border-line px-3 py-2 text-xs font-medium text-muted hover:text-fg hover:border-muted"
+                >
+                  <span>Tracklist .txt</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setPending(null)}
+                className="rounded-full px-3 py-2 text-xs text-muted hover:text-fg"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        </section>
+      )}
+
+      <section className="mt-2 rounded-card border border-line bg-surface p-5">
+        <div className="flex items-center justify-between">
+          <h3 className="font-display text-xl text-fg tracking-wide">
+            SAVED TAPES {takes.length > 0 && <span className="text-cyan text-sm ml-2">({takes.length})</span>}
+          </h3>
+        </div>
+
+        {takes.length === 0 ? (
+          <p className="mt-3 text-sm text-muted">
+            No saved tapes yet. Record a stream and tap &quot;Keep in Browser&quot; to store takes locally.
+          </p>
+        ) : (
+          <div className="mt-4 divide-y divide-line">
+            {takes.map((take) => {
+              const isPlaying = playingId === take.id;
+              const isBusy = busyId === take.id;
+              const duration = take.endedAt - take.startedAt;
+              return (
+                <div key={take.id} className="flex flex-col sm:flex-row sm:items-center sm:justify-between py-3 gap-2">
+                  <div className="min-w-0">
+                    <p className="font-display text-base text-fg truncate">{take.stationName}</p>
+                    <p className="text-xs text-muted">
+                      {new Date(take.startedAt).toLocaleString()} · {formatDuration(duration)} · {formatBytes(take.bytes)}
+                      {take.tracks.length > 0 && ` · ${take.tracks.length} track(s)`}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={isBusy}
+                      onClick={() => void onPlayTake(take)}
+                      className={`inline-flex items-center gap-1 rounded-full px-3 py-1.5 text-xs font-semibold ${
+                        isPlaying
+                          ? "bg-cyan text-bg"
+                          : "border border-line text-fg hover:border-muted"
+                      }`}
+                    >
+                      <Play className={`h-3.5 w-3.5 ${isPlaying ? "fill-current" : ""}`} />
+                      <span>{isPlaying ? "Pause" : "Play"}</span>
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isBusy}
+                      onClick={() => void onDownloadTake(take)}
+                      className="inline-flex items-center gap-1 rounded-full border border-line px-3 py-1.5 text-xs text-muted hover:text-fg hover:border-muted"
+                    >
+                      <Download className="h-3.5 w-3.5" />
+                      <span>MP3</span>
+                    </button>
+                    {confirmId === take.id ? (
+                      <div className="flex items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={() => void onDeleteTake(take.id)}
+                          className="rounded px-2 py-1 text-xs text-record bg-record/10 hover:bg-record/20"
+                        >
+                          Delete
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConfirmId(null)}
+                          className="rounded px-2 py-1 text-xs text-muted hover:text-fg"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => setConfirmId(take.id)}
+                        className="p-1.5 text-muted hover:text-record transition-colors"
+                        aria-label="Delete take"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
+
+      {/* Audio elements for monitor and library playback */}
+      <audio ref={audioRef} preload="none" />
+      <audio
+        ref={libraryAudioRef}
+        preload="none"
+        onEnded={() => stopLibraryPlayback()}
+      />
+    </div>
+  );
+}
