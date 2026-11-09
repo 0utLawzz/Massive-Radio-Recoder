@@ -5,12 +5,17 @@
   --color-surface: #102838;
   --color-fg: #e7f3f6;
   --color-muted: #8eacb8;
-  --color-cyan: #2ec4d6;
-  --color-record: #ff3b5c;
+  --color-cyan: #00f0ff;
+  --color-gold: #ffb01f;
+  --color-purple: #c026d3;
+  --color-record: #ff2a51;
   --color-line: #1c3d4e;
   --font-sans: "Figtree", ui-sans-serif, system-ui, sans-serif;
-  --font-display: "Oswald", "Arial Narrow", sans-serif;
-  --radius-card: 1.25rem;
+  --font-display: "Orbitron", "Oswald", "Arial Narrow", sans-serif;
+  --font-orbitron: "Orbitron", sans-serif;
+  --font-rajdhani: "Rajdhani", sans-serif;
+  --font-tech: "Share Tech Mono", monospace;
+  --radius-card: 1rem;
 }
 
 @layer base {
@@ -32,7 +37,7 @@
 
   ::selection {
     background: var(--color-cyan);
-    color: var(--color-bg);
+    color: #000;
   }
 
   @media (prefers-reduced-motion: reduce) {
@@ -45,3 +50,85 @@
     }
   }
 }
+
+/* Cyber Theme Custom Utilities */
+.font-orbitron {
+  font-family: "Orbitron", sans-serif;
+}
+
+.font-rajdhani {
+  font-family: "Rajdhani", sans-serif;
+}
+
+.font-tech {
+  font-family: "Share Tech Mono", monospace;
+}
+
+/* Cyber Grids and Textures */
+.cyber-grid-bg {
+  background-image: 
+    linear-gradient(to right, rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+.cyber-dots-bg {
+  background-image: radial-gradient(rgba(255, 255, 255, 0.08) 1px, transparent 0);
+  background-size: 16px 16px;
+}
+
+/* Chamfered Cyber Corners */
+.cyber-corner {
+  clip-path: polygon(
+    0 8px,
+    8px 0,
+    calc(100% - 8px) 0,
+    100% 8px,
+    100% calc(100% - 8px),
+    calc(100% - 8px) 100%,
+    8px 100%,
+    0 calc(100% - 8px)
+  );
+}
+
+.cyber-corner-lg {
+  clip-path: polygon(
+    0 16px,
+    16px 0,
+    calc(100% - 16px) 0,
+    100% 16px,
+    100% calc(100% - 16px),
+    calc(100% - 16px) 100%,
+    16px 100%,
+    0 calc(100% - 16px)
+  );
+}
+
+/* Animations */
+@keyframes cyber-scan {
+  0% { transform: translateY(-100%); }
+  100% { transform: translateY(1000%); }
+}
+
+@keyframes cyber-radar {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@keyframes cyber-pulse-glow {
+  0%, 100% { opacity: 0.6; filter: drop-shadow(0 0 12px currentColor); }
+  50% { opacity: 1; filter: drop-shadow(0 0 24px currentColor); }
+}
+
+.animate-cyber-radar {
+  animation: cyber-radar 12s linear infinite;
+}
+
+.animate-cyber-radar-fast {
+  animation: cyber-radar 4s linear infinite;
+}
+
+.animate-pulse-glow {
+  animation: cyber-pulse-glow 2.5s ease-in-out infinite;
+}
+

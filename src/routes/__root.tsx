@@ -3,7 +3,7 @@ import { AuthProvider } from "@/lib/auth/provider";
 import { PreviewHostBridge } from "@/components/preview-host-bridge";
 import appCss from "../styles.css?url";
 
-const APP_NAME = "Massive Tape";
+const APP_NAME = "Massive Radio Recorder";
 
 export const Route = createRootRoute({
   head: () => ({
@@ -13,7 +13,7 @@ export const Route = createRootRoute({
       { title: APP_NAME },
       {
         name: "description",
-        content: "Record the Massive Dance live stream and save it as an MP3.",
+        content: "Record the Massive Dance live stream and save it as an MP3 on your device.",
       },
       { name: "theme-color", content: "#07141c" },
     ],
@@ -23,7 +23,7 @@ export const Route = createRootRoute({
       { rel: "preconnect", href: "https://fonts.gstatic.com", crossOrigin: "anonymous" },
       {
         rel: "stylesheet",
-        href: "https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&family=Oswald:wght@500;600&display=swap",
+        href: "https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&family=Orbitron:wght@600;700;800;900&family=Oswald:wght@500;600&family=Rajdhani:wght@500;600;700&family=Share+Tech+Mono&display=swap",
       },
       { rel: "stylesheet", href: appCss },
       { rel: "manifest", href: "/__grok/manifest.webmanifest" },
@@ -32,10 +32,10 @@ export const Route = createRootRoute({
   }),
   component: () => (
     <html lang="en" suppressHydrationWarning>
-      <head>
+      <head suppressHydrationWarning>
         <HeadContent />
       </head>
-      <body>
+      <body suppressHydrationWarning>
         <PreviewHostBridge />
         <AuthProvider>
           <Outlet />

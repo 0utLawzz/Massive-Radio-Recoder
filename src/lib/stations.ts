@@ -32,6 +32,14 @@ export const STATIONS: Station[] = [
     statusUrl: "https://puma.streemlion.com:3955/status-json.xsl",
     bitrate: 192,
   },
+  {
+    id: "synth",
+    name: "Cyber Synth",
+    tagline: "OutLawZ Cyberpunk & Darksynth",
+    streamUrl: "https://stream.nightride.fm/nightride.mp3",
+    statusUrl: "https://stream.nightride.fm/status-json.xsl",
+    bitrate: 320,
+  },
 ];
 
 export async function fetchNowPlaying(statusUrl: string): Promise<string | null> {
