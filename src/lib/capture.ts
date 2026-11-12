@@ -27,7 +27,7 @@ export function startCapture(options: CaptureOptions) {
   let reason: CaptureReason = "stopped";
   const chunks: Uint8Array[] = [];
   let bytes = 0;
-  const startedAt = Date.now();
+  let startedAt = 0;
   let lastTick = 0;
   let limitTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -36,10 +36,6 @@ export function startCapture(options: CaptureOptions) {
     stopped = true;
     ac.abort();
   };
-
-  if (options.limitMs && options.limitMs > 0) {
-    limitTimer = setTimeout(() => stop("limit"), options.limitMs);
-  }
 
   const promise = (async (): Promise<CaptureResult> => {
     let error: string | undefined;
@@ -60,6 +56,15 @@ export function startCapture(options: CaptureOptions) {
           break;
         }
         if (!value?.byteLength) continue;
+
+        // Accurately record start time on first audio data chunk, avoiding network connection delay
+        if (startedAt === 0) {
+          startedAt = Date.now();
+          if (options.limitMs && options.limitMs > 0) {
+            limitTimer = setTimeout(() => stop("limit"), options.limitMs);
+          }
+        }
+
         const copy = new Uint8Array(value.byteLength);
         copy.set(value);
         bytes += copy.byteLength;
@@ -90,11 +95,12 @@ export function startCapture(options: CaptureOptions) {
       options.onBytes(bytes);
     }
 
+    const now = Date.now();
     return {
       chunks,
       bytes,
-      startedAt,
-      endedAt: Date.now(),
+      startedAt: startedAt || now,
+      endedAt: now,
       reason,
       error,
     };

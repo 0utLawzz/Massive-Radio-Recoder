@@ -43,17 +43,26 @@ export const STATIONS: Station[] = [
 ];
 
 export async function fetchNowPlaying(statusUrl: string): Promise<string | null> {
-  const res = await fetch(statusUrl, { cache: "no-store" });
-  if (!res.ok) return null;
-  const data = (await res.json()) as {
-    icestats?: { source?: unknown };
-  };
-  const source = data.icestats?.source;
-  const item = Array.isArray(source) ? source[0] : source;
-  if (!item || typeof item !== "object") return null;
-  const rec = item as Record<string, unknown>;
-  const title = rec.title ?? rec.yp_currently_playing;
-  if (typeof title !== "string") return null;
-  const trimmed = title.trim();
-  return trimmed.length ? trimmed : null;
+  if (!statusUrl) return null;
+  try {
+    const res = await fetch(statusUrl, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(6000),
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as {
+      icestats?: { source?: unknown };
+    };
+    const source = data.icestats?.source;
+    const item = Array.isArray(source) ? source[0] : source;
+    if (!item || typeof item !== "object") return null;
+    const rec = item as Record<string, unknown>;
+    const title = rec.title ?? rec.yp_currently_playing;
+    if (typeof title !== "string") return null;
+    const trimmed = title.trim();
+    return trimmed.length ? trimmed : null;
+  } catch {
+    return null;
+  }
 }
+

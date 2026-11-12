@@ -18,13 +18,20 @@ import {
   Gauge,
   Wifi,
   Video as VideoIcon,
+  ExternalLink,
+  Upload,
+  RotateCcw,
 } from "lucide-react";
 import { canPickSaveFile, pickSaveFile, startCapture, type CaptureReason } from "@/lib/capture";
 import { downloadBlob, formatBytes, formatDuration, recordingName } from "@/lib/format";
 import { deleteTake, getTakeBlob, listTakes, saveTake, type TakeMeta, type TrackMark } from "@/lib/library";
 import { fetchNowPlaying, STATIONS, type Station } from "@/lib/stations";
-
-export type BattlestationTheme = "gold" | "cyan" | "purple";
+import { fetchAlbumArtwork, getYouTubeSearchUrl, parseTrackMeta } from "@/lib/artwork";
+import {
+  renderVideoComposition,
+  type BattlestationTheme,
+  type VisualizerMode,
+} from "@/lib/video-composition";
 
 const LIMITS = [
   { id: "off", label: "Manual", ms: null },
@@ -57,8 +64,6 @@ type Graph = {
   analyser: AnalyserNode;
   streamDest: MediaStreamAudioDestinationNode;
 };
-
-type VisualizerMode = "spectrum" | "oscilloscope" | "reactor";
 
 // Cyber Audio Synthesizer (Subtle futuristic tactile feedback)
 function playCyberSfx(type: "click" | "arm" | "rec" | "stop") {
@@ -144,7 +149,7 @@ export function Deck() {
   const [canDirect, setCanDirect] = useState(false);
   const [soundFx, setSoundFx] = useState(true);
 
-  // Capture mode: AUDIO (MP3) or VIDEO (MP4/WEBM with live visualizer + synchronized audio)
+  // Capture mode: AUDIO (MP3) or VIDEO (1080p 16:9 MP4/WEBM with rotating vinyl + visualizer)
   const [recordMode, setRecordMode] = useState<"audio" | "video">("audio");
   const recordModeRef = useRef<"audio" | "video">("audio");
 
@@ -160,7 +165,14 @@ export function Deck() {
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // Audio analysis telemetry
+  // Artwork & Track Metadata State
+  const [customArtworkUrl, setCustomArtworkUrl] = useState<string | null>(null);
+  const [autoArtworkUrl, setAutoArtworkUrl] = useState<string | null>(null);
+  const [artworkLoading, setArtworkLoading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const artworkImgRef = useRef<HTMLImageElement | null>(null);
+
+  // Audio analysis telemetry (throttled for UI performance)
   const [peakDb, setPeakDb] = useState("-∞");
   const [bassLevel, setBassLevel] = useState(0.2);
   const [midLevel, setMidLevel] = useState(0.2);
@@ -175,6 +187,7 @@ export function Deck() {
   // Terminal telemetry logs
   const [sysLogs, setSysLogs] = useState<string[]>([
     "INITIALIZING OUTLAWZ HUD // BATTMOD V3.8",
+    "FULL HD 1080P COMPOSITION ENGINE ARMED",
     "AUDIO ANALYZER MATRIX READY",
     "SECURE ICECAST DECODER STANDBY",
     "DUAL-MODE CAPTURE ENGINE: AUDIO + VIDEO ACTIVE",
@@ -205,7 +218,9 @@ export function Deck() {
   const startedRef = useRef(0);
   const recordingRef = useRef(false);
   const libraryUrl = useRef<string | null>(null);
-  const playingUrlTake = useRef<string | null>(null);
+  const vinylAngleRef = useRef(0);
+  const lastFrameTimeRef = useRef(performance.now());
+  const lastStateUpdateRef = useRef(0);
 
   useEffect(() => {
     recordModeRef.current = recordMode;
@@ -264,6 +279,76 @@ export function Deck() {
     };
   }, [stationId]);
 
+  // Automatic Artwork Lookup via iTunes API
+  useEffect(() => {
+    let alive = true;
+    const meta = parseTrackMeta(nowPlaying);
+    if (!meta.searchQuery || meta.searchQuery === "OutLawZ Cyber Beats") {
+      setAutoArtworkUrl(null);
+      return;
+    }
+
+    setArtworkLoading(true);
+    void fetchAlbumArtwork(meta.searchQuery)
+      .then((artUrl) => {
+        if (!alive) return;
+        setAutoArtworkUrl(artUrl);
+        if (artUrl) appendLog(`ARTWORK_FOUND: ${meta.artist}`);
+      })
+      .catch(() => {
+        if (alive) setAutoArtworkUrl(null);
+      })
+      .finally(() => {
+        if (alive) setArtworkLoading(false);
+      });
+
+    return () => {
+      alive = false;
+    };
+  }, [nowPlaying]);
+
+  // Load image object for canvas rendering with priority: Custom > Auto > None
+  useEffect(() => {
+    const activeUrl = customArtworkUrl || autoArtworkUrl;
+    if (!activeUrl) {
+      artworkImgRef.current = null;
+      return;
+    }
+
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.src = activeUrl;
+    img.onload = () => {
+      artworkImgRef.current = img;
+    };
+    img.onerror = () => {
+      artworkImgRef.current = null;
+    };
+  }, [customArtworkUrl, autoArtworkUrl]);
+
+  // Handle custom artwork file upload
+  const handleArtworkUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (soundFx) playCyberSfx("click");
+    if (customArtworkUrl) {
+      URL.revokeObjectURL(customArtworkUrl);
+    }
+    const objectUrl = URL.createObjectURL(file);
+    setCustomArtworkUrl(objectUrl);
+    appendLog(`CUSTOM_ARTWORK_ATTACHED: ${file.name}`);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const removeCustomArtwork = () => {
+    if (soundFx) playCyberSfx("click");
+    if (customArtworkUrl) {
+      URL.revokeObjectURL(customArtworkUrl);
+      setCustomArtworkUrl(null);
+      appendLog("CUSTOM_ARTWORK_REMOVED");
+    }
+  };
+
   // Recording Clock
   useEffect(() => {
     if (!recording) return;
@@ -296,7 +381,7 @@ export function Deck() {
     };
   }, []);
 
-  // Canvas Visualizer Engine
+  // 1920x1080 Full HD Video & Visualizer Canvas Engine
   useEffect(() => {
     const canvas = canvasRef.current;
     const audio = audioRef.current;
@@ -308,207 +393,96 @@ export function Deck() {
     const freqBins = new Uint8Array(128);
     const timeDomainBins = new Uint8Array(128);
 
-    const themeColors = {
-      gold: {
-        primary: "#ffb01f",
-        accent: "#ffd447",
-        glow: "rgba(255, 176, 31, 0.4)",
-        grid: "rgba(255, 176, 31, 0.15)",
-        dark: "#141108",
-      },
-      cyan: {
-        primary: "#00f0ff",
-        accent: "#39ff14",
-        glow: "rgba(0, 240, 255, 0.4)",
-        grid: "rgba(0, 240, 255, 0.15)",
-        dark: "#05131c",
-      },
-      purple: {
-        primary: "#c026d3",
-        accent: "#00ff88",
-        glow: "rgba(192, 38, 211, 0.4)",
-        grid: "rgba(192, 38, 211, 0.15)",
-        dark: "#160924",
-      },
-    }[theme];
+    lastFrameTimeRef.current = performance.now();
 
-    const render = () => {
-      const width = canvas.width;
-      const height = canvas.height;
-      ctx2d.fillStyle = "#07090e";
-      ctx2d.fillRect(0, 0, width, height);
+    const render = (timeNow: number) => {
+      const dt = Math.min(0.1, (timeNow - lastFrameTimeRef.current) / 1000);
+      lastFrameTimeRef.current = timeNow;
 
       const isLive = Boolean(audio && !audio.paused && audio.src);
+
+      // Rotate vinyl only when stream is actively playing
+      if (isLive) {
+        // ~33 RPM rotation speed: 2 * PI * (33.33 / 60) ≈ 3.49 rad/s (using 1.8 rad/s for smooth viewing)
+        vinylAngleRef.current += dt * 1.8;
+      }
+
       let graph: Graph | null = null;
       if (isLive && audio) {
         graph = attachAnalyser(audio);
         if (graph?.ctx.state === "suspended") void graph.ctx.resume();
       }
 
+      let curBass = 0.2;
+      let curMid = 0.2;
+      let curTreble = 0.2;
+      let curPeakStr = "-∞";
+
       if (graph && isLive) {
         graph.analyser.getByteFrequencyData(freqBins);
         graph.analyser.getByteTimeDomainData(timeDomainBins);
 
-        // Telemetry calculation
-        let sum = 0;
         let bSum = 0;
         let mSum = 0;
         let tSum = 0;
         for (let i = 0; i < 40; i++) {
-          sum += freqBins[i] || 0;
           if (i < 8) bSum += freqBins[i] || 0;
           else if (i < 24) mSum += freqBins[i] || 0;
           else tSum += freqBins[i] || 0;
         }
-        const _avg = sum / 40;
-        const bAvg = bSum / 8;
-        const mAvg = mSum / 16;
-        const tAvg = tSum / 16;
-
-        setBassLevel(Math.min(1, bAvg / 255));
-        setMidLevel(Math.min(1, mAvg / 255));
-        setTrebleLevel(Math.min(1, tAvg / 255));
+        curBass = Math.min(1, bSum / 8 / 255);
+        curMid = Math.min(1, mSum / 16 / 255);
+        curTreble = Math.min(1, tSum / 16 / 255);
 
         const peak = Math.max(...freqBins);
         if (peak > 0) {
           const db = Math.round(20 * Math.log10(peak / 255));
-          setPeakDb(`${db} dBFS`);
-        } else {
-          setPeakDb("-∞");
+          curPeakStr = `${db} dBFS`;
         }
 
-        // Render Mode 1: Multi-band Spectrum Equalizer
-        if (vizMode === "spectrum") {
-          const barCount = 36;
-          const barWidth = width / barCount - 2;
-          const half = Math.floor(barCount / 2);
-
-          for (let i = 0; i < barCount; i++) {
-            const dist = Math.abs(i - (barCount - 1) / 2);
-            const norm = half > 0 ? dist / half : 0;
-            const binIdx = Math.min(freqBins.length - 1, Math.floor(norm * (freqBins.length * 0.75)));
-            const val = freqBins[binIdx] / 255;
-            const barH = Math.max(4, val * (height * 0.88));
-            const x = i * (barWidth + 2);
-            const y = height - barH;
-
-            // Gradient bar
-            const grad = ctx2d.createLinearGradient(0, height, 0, y);
-            grad.addColorStop(0, themeColors.primary);
-            grad.addColorStop(0.7, themeColors.accent);
-            grad.addColorStop(1, "#ff3b5c");
-
-            ctx2d.fillStyle = grad;
-            ctx2d.fillRect(x, y, barWidth, barH);
-
-            // Floating peak marker
-            ctx2d.fillStyle = "#ffffff";
-            ctx2d.fillRect(x, Math.max(0, y - 3), barWidth, 1.5);
-          }
-        }
-        // Render Mode 2: Cyber Oscilloscope Waveform
-        else if (vizMode === "oscilloscope") {
-          ctx2d.lineWidth = 2.5;
-          ctx2d.strokeStyle = themeColors.primary;
-          ctx2d.shadowColor = themeColors.accent;
-          ctx2d.shadowBlur = 10;
-          ctx2d.beginPath();
-
-          const sliceWidth = width / timeDomainBins.length;
-          let x = 0;
-          for (let i = 0; i < timeDomainBins.length; i++) {
-            const v = timeDomainBins[i] / 128.0;
-            const y = (v * height) / 2;
-            if (i === 0) ctx2d.moveTo(x, y);
-            else ctx2d.lineTo(x, y);
-            x += sliceWidth;
-          }
-          ctx2d.stroke();
-          ctx2d.shadowBlur = 0;
-        }
-        // Render Mode 3: Cyber Reactor Radar
-        else if (vizMode === "reactor") {
-          const cx = width / 2;
-          const cy = height / 2;
-          const maxR = Math.min(cx, cy) - 8;
-
-          // Background concentric target rings
-          ctx2d.strokeStyle = themeColors.grid;
-          ctx2d.lineWidth = 1;
-          for (let r = maxR * 0.25; r <= maxR; r += maxR * 0.25) {
-            ctx2d.beginPath();
-            ctx2d.arc(cx, cy, r, 0, Math.PI * 2);
-            ctx2d.stroke();
-          }
-
-          // Dynamic radial energy spikes
-          const points = 48;
-          ctx2d.strokeStyle = themeColors.primary;
-          ctx2d.lineWidth = 2;
-          ctx2d.beginPath();
-          for (let i = 0; i < points; i++) {
-            const angle = (i / points) * Math.PI * 2;
-            const binVal = freqBins[i % 32] / 255;
-            const r = maxR * 0.4 + binVal * (maxR * 0.6);
-            const px = cx + Math.cos(angle) * r;
-            const py = cy + Math.sin(angle) * r;
-            if (i === 0) ctx2d.moveTo(px, py);
-            else ctx2d.lineTo(px, py);
-          }
-          ctx2d.closePath();
-          ctx2d.stroke();
-        }
-      } else {
-        // Idle animation: subtle breathing cyber pulse
-        const time = Date.now() * 0.002;
-        ctx2d.strokeStyle = themeColors.grid;
-        ctx2d.lineWidth = 1.5;
-        ctx2d.beginPath();
-        for (let x = 0; x < width; x += 4) {
-          const y = height / 2 + Math.sin(x * 0.03 + time) * 6;
-          if (x === 0) ctx2d.moveTo(x, y);
-          else ctx2d.lineTo(x, y);
-        }
-        ctx2d.stroke();
-      }
-
-      // HUD Watermark and Metadata Overlay on Canvas for Video & Screen
-      ctx2d.font = "bold 11px Orbitron, sans-serif";
-      ctx2d.fillStyle = themeColors.primary;
-      ctx2d.fillText("OutLawZ™ // BE THE NAME", 12, 18);
-
-      ctx2d.font = "10px 'Share Tech Mono', monospace";
-      ctx2d.fillStyle = "rgba(255, 255, 255, 0.6)";
-      const stTitle = (stationRef.current?.name ?? "LIVE STREAM").toUpperCase();
-      const stWidth = ctx2d.measureText(stTitle).width;
-      ctx2d.fillText(stTitle, width - stWidth - 12, 18);
-
-      // Track title marquee at bottom
-      const trackText = (nowPlayingRef.current ?? stationRef.current?.tagline ?? "BROADCAST TRANSMISSION").toUpperCase();
-      ctx2d.font = "bold 11px Rajdhani, sans-serif";
-      ctx2d.fillStyle = "#ffffff";
-      ctx2d.fillText(trackText.slice(0, 52), 12, height - 10);
-
-      // Live Video Recording Indicator
-      if (recordingRef.current && recordModeRef.current === "video") {
-        const isFlash = Math.floor(Date.now() / 500) % 2 === 0;
-        if (isFlash) {
-          ctx2d.fillStyle = "#ff2a51";
-          ctx2d.beginPath();
-          ctx2d.arc(width - 95, height - 13, 4, 0, Math.PI * 2);
-          ctx2d.fill();
-          ctx2d.font = "bold 10px 'Share Tech Mono', monospace";
-          ctx2d.fillStyle = "#ff2a51";
-          ctx2d.fillText("REC VIDEO", width - 85, height - 10);
+        // Throttle React state telemetry updates to 5 Hz (every 200ms) to prevent 60 FPS re-renders
+        if (timeNow - lastStateUpdateRef.current > 200) {
+          lastStateUpdateRef.current = timeNow;
+          setBassLevel(curBass);
+          setMidLevel(curMid);
+          setTrebleLevel(curTreble);
+          setPeakDb(curPeakStr);
         }
       }
+
+      const parsed = parseTrackMeta(nowPlayingRef.current ?? stationRef.current?.name);
+
+      // Render 1920x1080 Full HD Composition
+      renderVideoComposition({
+        ctx: ctx2d,
+        width: 1920,
+        height: 1080,
+        freqBins,
+        timeDomainBins,
+        isLive,
+        theme,
+        vizMode,
+        artist: parsed.artist,
+        title: parsed.title,
+        stationName: stationRef.current?.name ?? "LIVE STREAM",
+        bitrate: stationRef.current?.bitrate ?? 192,
+        artworkImage: artworkImgRef.current,
+        vinylAngle: vinylAngleRef.current,
+        recording: recordingRef.current && recordModeRef.current === "video",
+        recordElapsedMs: recordingRef.current && startedRef.current ? Math.max(0, Date.now() - startedRef.current) : 0,
+        recordBytes: bytes,
+        peakDb: curPeakStr,
+        bassLevel: curBass,
+        midLevel: curMid,
+        trebleLevel: curTreble,
+      });
 
       frame = window.requestAnimationFrame(render);
     };
 
     frame = window.requestAnimationFrame(render);
     return () => window.cancelAnimationFrame(frame);
-  }, [theme, vizMode]);
+  }, [theme, vizMode, bytes]);
 
   const elapsed = recording && startedAt ? Math.max(0, (clock || startedAt) - startedAt) : 0;
   const limit = LIMITS.find((item) => item.id === limitId) ?? LIMITS[0];
@@ -689,7 +663,7 @@ export function Deck() {
       return;
     }
 
-    // Capture visualizer stream at 60 FPS
+    // Capture 1920x1080 visualizer stream at 60 FPS
     const canvasElement = canvas as HTMLCanvasElement & {
       captureStream?: (fps?: number) => MediaStream;
       mozCaptureStream?: (fps?: number) => MediaStream;
@@ -723,8 +697,6 @@ export function Deck() {
         mimeType = "video/webm;codecs=vp9,opus";
       } else if (MediaRecorder.isTypeSupported("video/webm;codecs=vp8,opus")) {
         mimeType = "video/webm;codecs=vp8,opus";
-      } else if (MediaRecorder.isTypeSupported("video/webm")) {
-        mimeType = "video/webm";
       } else if (MediaRecorder.isTypeSupported("video/mp4")) {
         mimeType = "video/mp4";
       }
@@ -733,7 +705,8 @@ export function Deck() {
     videoChunksRef.current = [];
     let recorder: MediaRecorder;
     try {
-      recorder = new MediaRecorder(combinedStream, { mimeType, videoBitsPerSecond: 2800000 });
+      // 6 Mbps high-fidelity 1080p encoding
+      recorder = new MediaRecorder(combinedStream, { mimeType, videoBitsPerSecond: 6000000 });
     } catch {
       recorder = new MediaRecorder(combinedStream);
     }
@@ -752,7 +725,7 @@ export function Deck() {
     setBytes(0);
     setRecording(true);
     if (soundFx) playCyberSfx("rec");
-    appendLog(`VIDEO_RECORDING_ENGAGED: ${current.name} [${mimeType}]`);
+    appendLog(`VIDEO_RECORDING_ENGAGED: 1080P FULL HD // [${recorder.mimeType || mimeType}]`);
 
     recorder.ondataavailable = (e) => {
       if (e.data && e.data.size > 0) {
@@ -865,10 +838,11 @@ export function Deck() {
   function onDownload() {
     if (!pending?.blob) return;
     if (soundFx) playCyberSfx("click");
-    const ext = pending.mediaType === "video" ? "webm" : "mp3";
+    const isVideo = pending.mediaType === "video";
+    const ext = isVideo ? (pending.blob.type.includes("mp4") ? "mp4" : "webm") : "mp3";
     downloadBlob(pending.blob, recordingName(pending.stationName, new Date(pending.startedAt), ext));
     setPending({ ...pending, downloaded: true });
-    appendLog(`${pending.mediaType === "video" ? "VIDEO" : "MP3"}_EXPORTED: ${pending.stationName}`);
+    appendLog(`${isVideo ? "VIDEO" : "MP3"}_EXPORTED: ${pending.stationName}`);
   }
 
   function onCueSheet() {
@@ -880,7 +854,7 @@ export function Deck() {
       `Captured: ${new Date(pending.startedAt).toLocaleString()}`,
       `Duration: ${formatDuration(pending.endedAt - pending.startedAt)}`,
       `Size: ${formatBytes(pending.bytes)}`,
-      `Type: ${pending.mediaType?.toUpperCase() ?? "AUDIO"}`,
+      `Type: ${pending.mediaType?.toUpperCase() ?? "AUDIO"} (1080p 60fps)`,
       "",
       `TRACK MARKS:`,
       ...(pending.tracks.length
@@ -946,7 +920,8 @@ export function Deck() {
         setError("Tape not found.");
         return;
       }
-      const ext = meta.mediaType === "video" ? "webm" : "mp3";
+      const isVideo = meta.mediaType === "video";
+      const ext = isVideo ? (blob.type.includes("mp4") ? "mp4" : "webm") : "mp3";
       downloadBlob(blob, recordingName(meta.stationName, new Date(meta.startedAt), ext));
     } finally {
       setBusyId(null);
@@ -1056,8 +1031,23 @@ export function Deck() {
     },
   }[theme];
 
+  const parsedMeta = parseTrackMeta(nowPlaying ?? station.name);
+  const activeArtwork = customArtworkUrl || autoArtworkUrl;
+
   return (
-    <div className={`flex flex-col gap-5 text-fg font-sans rounded-2xl transition-all duration-500 relative ${themeClasses.battlestationBg} p-2 sm:p-5`} suppressHydrationWarning>
+    <div
+      className={`flex flex-col gap-5 text-fg font-sans rounded-2xl transition-all duration-500 relative ${themeClasses.battlestationBg} p-2 sm:p-5`}
+      suppressHydrationWarning
+    >
+      {/* Hidden File Input for Custom Artwork Upload */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*"
+        onChange={handleArtworkUpload}
+        className="hidden"
+      />
+
       {/* Ambient Cyber Flank Chevrons (matching OutLawZ Battlestation artwork) */}
       <div className="pointer-events-none fixed left-1.5 top-1/3 hidden 2xl:flex flex-col gap-5 z-10 opacity-60">
         {[...Array(6)].map((_, i) => (
@@ -1075,16 +1065,14 @@ export function Deck() {
           </div>
         ))}
       </div>
+
       {/* HUD Top Control Bar */}
       <header className={`rounded-xl border p-4 sm:p-5 backdrop-blur-md ${themeClasses.panelBg} ${themeClasses.hudGlow}`}>
         <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
           {/* OutLawZ Logo with Glowing Emblem */}
           <div className="flex items-center gap-3.5">
             <div className="relative flex h-14 w-14 shrink-0 items-center justify-center rounded-xl border border-white/10 bg-black/80 shadow-inner">
-              {/* Spinning Cybernetic Rings */}
-              <div
-                className={`absolute inset-0 rounded-xl border border-dashed ${themeClasses.accentBorder} opacity-40 animate-cyber-radar`}
-              />
+              <div className={`absolute inset-0 rounded-xl border border-dashed ${themeClasses.accentBorder} opacity-40 animate-cyber-radar`} />
               <div
                 className="absolute h-9 w-9 rounded-full border border-current opacity-30 animate-pulse"
                 style={{ color: themeClasses.hex, transform: `scale(${1 + bassLevel * 0.4})` }}
@@ -1103,7 +1091,7 @@ export function Deck() {
               </div>
               <p className="font-tech text-xs tracking-wider text-muted mt-0.5 flex items-center gap-2">
                 <span className="inline-block h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
-                <span>CYBER HUD // AUDIO CAPTURE CORE</span>
+                <span>CYBER HUD // AUDIO & FULL HD 1080P RECORDER</span>
                 <span className="text-white/30 hidden sm:inline">|</span>
                 <span className="text-white/60 hidden sm:inline">{station.name}</span>
               </p>
@@ -1273,7 +1261,7 @@ export function Deck() {
         </div>
       </section>
 
-      {/* Main HUD Deck: Visualizer & Master Deck Controls */}
+      {/* Main HUD Deck: Player, 1080p Canvas Stage, and Master Controls */}
       <section className={`rounded-xl border p-4 sm:p-6 backdrop-blur-md ${themeClasses.panelBg} relative overflow-hidden`} suppressHydrationWarning>
         {/* Decorative HUD Corner Accents */}
         <div className={`absolute top-0 left-0 w-3 h-3 border-t-2 border-l-2 ${themeClasses.accentBorder} m-1 pointer-events-none`} />
@@ -1282,7 +1270,7 @@ export function Deck() {
         <div className={`absolute bottom-0 right-0 w-3 h-3 border-b-2 border-r-2 ${themeClasses.accentBorder} m-1 pointer-events-none`} />
 
         {/* Station Live Meta Banner & Master Record Core Button */}
-        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 border-b border-white/10 pb-4">
+        <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4 border-b border-white/10 pb-4">
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
               <span className={`px-2 py-0.5 rounded text-[10px] font-tech font-bold uppercase tracking-widest ${themeClasses.badgeBg}`}>
@@ -1290,10 +1278,19 @@ export function Deck() {
               </span>
               <span className="font-tech text-xs text-muted">SIGNAL 100% // {station.name}</span>
             </div>
+
+            {/* Track Title */}
             <h2 className="mt-1.5 font-orbitron text-xl sm:text-2xl font-bold tracking-wide text-white truncate drop-shadow-md">
-              {nowPlaying ?? "Waiting for broadcast metadata..."}
+              {parsedMeta.title || (nowPlaying ?? "Waiting for broadcast metadata...")}
             </h2>
-            <div className="mt-1.5 flex flex-wrap items-center gap-3 text-xs font-tech text-muted">
+
+            {/* Artist Subhead */}
+            <p className={`font-rajdhani text-sm sm:text-base font-semibold ${themeClasses.accentText} uppercase tracking-wider`}>
+              {parsedMeta.artist}
+            </p>
+
+            {/* Stream Telemetry & Quick Action Buttons */}
+            <div className="mt-2 flex flex-wrap items-center gap-2 sm:gap-3 text-xs font-tech text-muted">
               <span className="flex items-center gap-1">
                 <Gauge className="h-3.5 w-3.5" style={{ color: themeClasses.hex }} />
                 <span className="text-white/80">{station.bitrate} kbps Icecast MP3</span>
@@ -1305,12 +1302,56 @@ export function Deck() {
               </span>
               <span className="text-white/30">•</span>
               <span className="text-white/60">Audio Engine: Active</span>
+
+              {/* YouTube Search Button */}
+              <button
+                type="button"
+                onClick={() => {
+                  if (soundFx) playCyberSfx("click");
+                  const url = getYouTubeSearchUrl(parsedMeta.artist, parsedMeta.title);
+                  window.open(url, "_blank", "noopener,noreferrer");
+                }}
+                className="ml-auto inline-flex items-center gap-1.5 px-2.5 py-1 rounded border border-red-500/40 bg-red-950/20 text-red-400 hover:bg-red-900/30 font-tech text-[11px] transition-colors"
+                title="Search this track on YouTube"
+                suppressHydrationWarning
+              >
+                <ExternalLink className="h-3 w-3" />
+                <span>YOUTUBE SEARCH</span>
+              </button>
+
+              {/* Artwork Controls */}
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                className={`inline-flex items-center gap-1 px-2.5 py-1 rounded border text-[11px] font-tech transition-colors ${
+                  customArtworkUrl
+                    ? "border-emerald-500/50 bg-emerald-950/30 text-emerald-300"
+                    : "border-white/20 bg-white/5 text-white/80 hover:bg-white/10"
+                }`}
+                title="Upload custom album artwork for video"
+                suppressHydrationWarning
+              >
+                <Upload className="h-3 w-3" />
+                <span>{customArtworkUrl ? "CUSTOM ART ACTIVE" : "UPLOAD ART"}</span>
+              </button>
+
+              {customArtworkUrl && (
+                <button
+                  type="button"
+                  onClick={removeCustomArtwork}
+                  className="p-1 rounded border border-white/10 text-white/50 hover:text-white hover:border-white/30"
+                  title="Revert to automatic track artwork"
+                  suppressHydrationWarning
+                >
+                  <RotateCcw className="h-3 w-3" />
+                </button>
+              )}
             </div>
           </div>
 
-          {/* Master Controls: Capture Mode Toggle & Glowing RECORD CORE */}
+          {/* Master Controls: Capture Mode Toggle & Circular Record Button with Vinyl / Artwork */}
           <div className="flex flex-col sm:flex-row items-center gap-4 shrink-0">
-            {/* Capture Mode Toggle: AUDIO (MP3) vs VIDEO (MP4/WEBM) */}
+            {/* Capture Mode Toggle: AUDIO (MP3) vs VIDEO (1080p Full HD) */}
             <div className="flex items-center gap-1 bg-black/60 border border-white/10 p-1 rounded-xl shadow-inner font-tech" suppressHydrationWarning>
               <button
                 type="button"
@@ -1344,10 +1385,11 @@ export function Deck() {
                 suppressHydrationWarning
               >
                 <VideoIcon className="h-3.5 w-3.5" />
-                <span>VIDEO (MP4/WEBM)</span>
+                <span>VIDEO (1080P)</span>
               </button>
             </div>
 
+            {/* Circular Record Core / Vinyl Button */}
             <button
               type="button"
               onClick={() => void onRecord()}
@@ -1356,50 +1398,96 @@ export function Deck() {
               className="group relative flex flex-col items-center gap-1.5 focus:outline-none disabled:opacity-50"
               suppressHydrationWarning
             >
-              {/* Pulsing Neon Core Ring */}
               <div
-                className={`relative grid h-20 w-20 sm:h-24 sm:w-24 place-items-center rounded-full border-2 transition-transform duration-300 ${
+                className={`relative grid h-20 w-20 sm:h-24 sm:w-24 place-items-center rounded-full border-2 transition-transform duration-300 overflow-hidden ${
                   recording
-                    ? "border-red-500 bg-red-950/40 shadow-[0_0_30px_rgba(255,42,81,0.6)] scale-105"
+                    ? "border-red-500 bg-red-950/40 shadow-[0_0_30px_rgba(255,42,81,0.7)] scale-105"
                     : arming
                     ? "border-amber-400 bg-amber-950/40 shadow-[0_0_20px_rgba(251,191,36,0.5)]"
-                    : `${themeClasses.accentBorder} bg-black/60 hover:scale-105 shadow-[0_0_20px_rgba(255,255,255,0.08)]`
+                    : `${themeClasses.accentBorder} bg-black/80 hover:scale-105 shadow-[0_0_20px_rgba(255,255,255,0.08)]`
                 }`}
               >
                 {recording && (
-                  <div className="absolute inset-0 rounded-full border-2 border-red-500/80 animate-ping opacity-75" />
+                  <div className="absolute inset-0 rounded-full border-2 border-red-500/80 animate-ping opacity-75 pointer-events-none" />
                 )}
-                {/* Center Core Shape */}
-                <div
-                  className={`transition-all duration-300 ${
-                    recording
-                      ? "h-7 w-7 rounded-md bg-red-500 shadow-[0_0_15px_#ff2a51]"
-                      : arming
-                      ? "h-6 w-6 rounded-sm bg-amber-400 animate-spin"
-                      : `h-8 w-8 rounded-full ${themeClasses.accentBg} shadow-[0_0_15px_currentColor]`
-                  }`}
-                />
+
+                {/* If in video mode, display vinyl disc with artwork in record button */}
+                {recordMode === "video" ? (
+                  <div className="relative h-full w-full flex items-center justify-center p-1.5">
+                    {/* Spinning vinyl grooves background */}
+                    <div
+                      className={`h-full w-full rounded-full border border-white/20 bg-neutral-900 flex items-center justify-center relative overflow-hidden ${
+                        listening && !recording ? "animate-spin" : ""
+                      }`}
+                      style={{ animationDuration: "3s" }}
+                    >
+                      {activeArtwork ? (
+                        <img
+                          src={activeArtwork}
+                          alt="Album Art"
+                          className="h-full w-full object-cover rounded-full"
+                          crossOrigin="anonymous"
+                        />
+                      ) : (
+                        <div className="h-full w-full rounded-full bg-black/90 flex flex-col items-center justify-center p-1">
+                          <Disc className={`h-8 w-8 ${themeClasses.accentText}`} />
+                          <span className="text-[7px] font-tech text-white/60">OUTLAWZ</span>
+                        </div>
+                      )}
+                      {/* Spindle hole */}
+                      <div className="absolute h-3 w-3 rounded-full bg-black border border-white/60" />
+                    </div>
+
+                    {/* Recording overlay indicator */}
+                    {recording && (
+                      <div className="absolute inset-0 bg-red-900/60 flex items-center justify-center">
+                        <div className="h-6 w-6 rounded bg-red-500 shadow-[0_0_12px_#ff2a51] animate-pulse" />
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  /* Audio Mode: Cyber Record Core */
+                  <div
+                    className={`transition-all duration-300 ${
+                      recording
+                        ? "h-7 w-7 rounded-md bg-red-500 shadow-[0_0_15px_#ff2a51]"
+                        : arming
+                        ? "h-6 w-6 rounded-sm bg-amber-400 animate-spin"
+                        : `h-8 w-8 rounded-full ${themeClasses.accentBg} shadow-[0_0_15px_currentColor]`
+                    }`}
+                  />
+                )}
               </div>
-              <span className={`font-orbitron text-xs sm:text-sm font-black tracking-widest ${recording ? "text-red-400 animate-pulse" : themeClasses.accentText}`}>
+              <span
+                className={`font-orbitron text-xs sm:text-sm font-black tracking-widest ${
+                  recording ? "text-red-400 animate-pulse" : themeClasses.accentText
+                }`}
+              >
                 {arming
-                  ? "ARMING FILE..."
+                  ? "ARMING..."
                   : recording
-                  ? "TERMINATE REC"
+                  ? "STOP REC"
                   : recordMode === "video"
-                  ? "RECORD VIDEO"
+                  ? "REC VIDEO"
                   : "ENGAGE RECORD"}
               </span>
             </button>
           </div>
         </div>
 
-        {/* Live Audio Visualizer Canvas */}
-        <div className="mt-4 rounded-lg border border-white/10 bg-black/80 p-3 relative overflow-hidden">
-          <div className="flex items-center justify-between mb-2">
+        {/* 1920x1080 Responsive 16:9 Full HD Canvas Stage */}
+        <div className="mt-4 rounded-xl border border-white/10 bg-black/90 p-2 sm:p-3 relative overflow-hidden">
+          <div className="flex items-center justify-between mb-2 px-1">
             <div className="flex items-center gap-2 font-tech text-xs text-muted">
               <Activity className={`h-3.5 w-3.5 ${themeClasses.accentText}`} />
-              <span className="tracking-wider uppercase">DYNAMIC FREQUENCY MATRIX</span>
+              <span className="tracking-wider uppercase">16:9 FULL HD STUDIO STAGE</span>
+              <span className="text-white/30 hidden sm:inline">•</span>
+              <span className="text-white/50 hidden sm:inline">1920×1080 60FPS</span>
+              {artworkLoading && (
+                <span className="text-cyan text-[11px] animate-pulse hidden sm:inline">// FETCHING ARTWORK...</span>
+              )}
             </div>
+
             {/* Visualizer Mode Switcher */}
             <div className="flex items-center gap-1 font-tech text-[11px]" suppressHydrationWarning>
               <button
@@ -1444,15 +1532,15 @@ export function Deck() {
             </div>
           </div>
 
-          {/* Canvas Element with High-Res Rendering */}
+          {/* Master 1920x1080 Canvas (CSS scales responsively with 16:9 aspect ratio) */}
           <canvas
             ref={canvasRef}
-            width={760}
-            height={110}
-            className="w-full h-24 sm:h-28 block rounded"
+            width={1920}
+            height={1080}
+            className="w-full aspect-video block rounded-lg border border-white/10 bg-[#06080d] object-contain shadow-2xl"
           />
 
-          {/* Visualizer Frequency Distribution Meters */}
+          {/* Quick Audio Telemetry Meters Bar */}
           <div className="mt-2.5 pt-2 border-t border-white/10 grid grid-cols-3 gap-3 font-tech text-[11px] text-muted">
             <div>
               <div className="flex justify-between mb-1">
@@ -1609,7 +1697,7 @@ export function Deck() {
             <div className="flex items-center gap-2.5">
               <span className="h-2.5 w-2.5 rounded-full bg-red-500 shadow-[0_0_8px_#ff2a51]" />
               <span className="font-orbitron font-bold tracking-wider text-red-400">
-                {recordMode === "video" ? "VIDEO CAPTURE ACTIVE" : "AUDIO RECORDING ACTIVE"}
+                {recordMode === "video" ? "VIDEO CAPTURE ACTIVE (1080P 60FPS)" : "AUDIO RECORDING ACTIVE"}
               </span>
               <span className="font-tech text-sm text-white font-mono">{formatDuration(elapsed)}</span>
               {remaining !== null && (
@@ -1624,7 +1712,7 @@ export function Deck() {
         )}
       </section>
 
-      {/* Cyber Diagnostics & Stream Logs Console (matching Image 1 & 3) */}
+      {/* Cyber Diagnostics & Stream Logs Console */}
       <section className={`rounded-xl border p-4 backdrop-blur-md ${themeClasses.subPanelBg} font-tech text-xs`} suppressHydrationWarning>
         <div className="flex items-center justify-between border-b border-white/10 pb-2 mb-2.5">
           <div className="flex items-center gap-2 text-muted">
@@ -1702,7 +1790,7 @@ export function Deck() {
                   <Disc className={`h-4 w-4 ${themeClasses.accentText} animate-spin`} />
                 )}
                 <span className={`font-orbitron text-xs font-bold tracking-widest uppercase ${pending.mediaType === "video" ? "text-red-400" : themeClasses.accentText}`}>
-                  {pending.mediaType === "video" ? "VIDEO TAKE READY FOR DISPOSITION" : "AUDIO TAKE READY FOR DISPOSITION"}
+                  {pending.mediaType === "video" ? "VIDEO TAKE READY (1080P FULL HD)" : "AUDIO TAKE READY FOR DISPOSITION"}
                 </span>
               </div>
               <h3 className="font-orbitron text-lg font-bold text-white mt-1">
@@ -1712,7 +1800,7 @@ export function Deck() {
                 {pending.fileSaved
                   ? "Take successfully flushed straight into selected disk file."
                   : pending.mediaType === "video"
-                  ? "Visualizer video and synchronized audio stream captured in memory. Save video to device or keep in vault."
+                  ? "Full HD 1080p visualizer and synchronized audio captured in memory. Save to device or archive in vault."
                   : "Audio capture ready in memory. Save MP3 to device or archive in browser vault."}
               </p>
             </div>
@@ -1768,13 +1856,13 @@ export function Deck() {
             <div className="mt-4 pt-4 border-t border-white/10">
               <p className="font-tech text-xs text-muted mb-2 flex items-center gap-1.5">
                 <VideoIcon className="h-3.5 w-3.5 text-red-400" />
-                <span>VIDEO PREVIEW // SYNCED AUDIO VISUALIZER</span>
+                <span>VIDEO PREVIEW // 1080P SYNCED AUDIO VISUALIZER</span>
               </p>
               <video
                 src={URL.createObjectURL(pending.blob)}
                 controls
                 playsInline
-                className="w-full max-h-64 rounded-lg bg-black border border-white/20 object-contain"
+                className="w-full max-h-72 rounded-lg bg-black border border-white/20 object-contain"
               />
             </div>
           )}
@@ -1816,7 +1904,7 @@ export function Deck() {
               controls
               autoPlay
               playsInline
-              className="w-full max-h-72 rounded bg-black border border-white/20 object-contain"
+              className="w-full max-h-80 rounded bg-black border border-white/20 object-contain"
             />
           </div>
         )}
@@ -1841,7 +1929,7 @@ export function Deck() {
                       <p className="font-orbitron text-sm font-bold text-white truncate">{take.stationName}</p>
                       {isVideo ? (
                         <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-red-500/20 text-red-400 border border-red-500/40">
-                          🎬 VIDEO
+                          🎬 VIDEO 1080P
                         </span>
                       ) : (
                         <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-white/10 text-white/70 border border-white/20">
