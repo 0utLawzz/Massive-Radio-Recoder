@@ -12,6 +12,8 @@ A high-performance, dark cyberpunk browser radio player, direct audio stream cap
 - **In-Memory Capture Fallback**: Full browser-fallback recording using chunked `Uint8Array` buffers and client-side `Blob` packaging for browsers without direct file picker access.
 - **Accurate Time-Tracking**: Recording duration timestamps are initialized strictly upon receiving the first audio data packet, preventing network connection latency from skewing take lengths.
 - **Timed Auto-Stop**: Integrated limiter timers (15m, 30m, 1h, 2h, and Manual).
+- **Real-Time Auto-Gain Control (AGC)**: AudioWorklet-powered RMS loudness normalizer (with automatic AnalyserNode RMS fallback and brickwall `DynamicsCompressorNode` limiter) stabilizes stream volume before reaching `MediaStreamAudioDestinationNode` and monitor speakers. Monitor volume/mute is isolated via a separate `GainNode` so muting speakers never alters recording levels.
+- **Global Keyboard Shortcuts**: Scoped player controls (`Space` for Play/Pause, `M` for Mute, `R` for Audio/Video mode toggle) that preserve browser shortcuts (`Ctrl/Cmd+R`, etc.) and text input behavior.
 
 ### 2. YouTube-Style 16:9 Full HD Video Recorder
 - **1080p Master Canvas Composition**: 1920×1080 fixed backing canvas resolution captured at 60 FPS via `canvas.captureStream(60)`.
@@ -77,7 +79,8 @@ npm run build
 
 ## Key Files
 
-- `src/components/deck.tsx`: Master cyber HUD player, visualizer controller, and recorder interface.
+- `src/components/deck.tsx`: Master cyber HUD player, visualizer controller, keyboard shortcuts, and recorder interface.
+- `src/lib/agc.ts`: Real-time AudioWorklet + AnalyserNode Auto-Gain Control (AGC) loudness normalization graph.
 - `src/lib/video-composition.ts`: 1920×1080 16:9 canvas renderer with rotating vinyl disc and audio visualizer.
 - `src/lib/artwork.ts`: Track metadata parser, iTunes artwork search, and caching engine.
 - `src/lib/capture.ts`: Stream fetcher, direct file system writer, and connection delay compensation.

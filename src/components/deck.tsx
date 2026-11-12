@@ -21,6 +21,8 @@ import {
   ExternalLink,
   Upload,
   RotateCcw,
+  SlidersHorizontal,
+  Keyboard,
 } from "lucide-react";
 import { canPickSaveFile, pickSaveFile, startCapture, type CaptureReason } from "@/lib/capture";
 import { downloadBlob, formatBytes, formatDuration, recordingName } from "@/lib/format";
@@ -32,6 +34,14 @@ import {
   type BattlestationTheme,
   type VisualizerMode,
 } from "@/lib/video-composition";
+import {
+  attachAudioGraph,
+  setGraphAgcEnabled,
+  setGraphMonitorVolume,
+  stepAnalyserAgc,
+  type AgcMode,
+  type AudioGraph,
+} from "@/lib/agc";
 
 const LIMITS = [
   { id: "off", label: "Manual", ms: null },
@@ -57,12 +67,6 @@ type PendingTake = {
   kept: boolean;
   downloaded: boolean;
   mediaType: "audio" | "video";
-};
-
-type Graph = {
-  ctx: AudioContext;
-  analyser: AnalyserNode;
-  streamDest: MediaStreamAudioDestinationNode;
 };
 
 // Cyber Audio Synthesizer (Subtle futuristic tactile feedback)
@@ -118,24 +122,6 @@ function playCyberSfx(type: "click" | "arm" | "rec" | "stop") {
   }
 }
 
-function attachAnalyser(audio: HTMLAudioElement): Graph | null {
-  const tagged = audio as HTMLAudioElement & { __graph?: Graph };
-  if (tagged.__graph) return tagged.__graph;
-  const AudioCtx = window.AudioContext || (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-  if (!AudioCtx) return null;
-  const ctx = new AudioCtx();
-  const source = ctx.createMediaElementSource(audio);
-  const analyser = ctx.createAnalyser();
-  analyser.fftSize = 256;
-  const streamDest = ctx.createMediaStreamDestination();
-  source.connect(analyser);
-  analyser.connect(ctx.destination);
-  analyser.connect(streamDest);
-  const graph = { ctx, analyser, streamDest };
-  tagged.__graph = graph;
-  return graph;
-}
-
 export function Deck() {
   const volumeSliderId = useId();
   const [theme, setTheme] = useState<BattlestationTheme>("gold");
@@ -172,12 +158,15 @@ export function Deck() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const artworkImgRef = useRef<HTMLImageElement | null>(null);
 
-  // Audio analysis telemetry (throttled for UI performance)
+  // Audio analysis & Auto-Gain Control (AGC) telemetry (throttled for UI performance)
   const [peakDb, setPeakDb] = useState("-∞");
   const [bassLevel, setBassLevel] = useState(0.2);
   const [midLevel, setMidLevel] = useState(0.2);
   const [trebleLevel, setTrebleLevel] = useState(0.2);
   const [vizMode, setVizMode] = useState<VisualizerMode>("spectrum");
+  const [agcEnabled, setAgcEnabled] = useState(true);
+  const [agcMode, setAgcMode] = useState<AgcMode>("worklet");
+  const [agcGainDb, setAgcGainDb] = useState(0);
 
   // Custom station modal
   const [showCustomStation, setShowCustomStation] = useState(false);
@@ -188,7 +177,7 @@ export function Deck() {
   const [sysLogs, setSysLogs] = useState<string[]>([
     "INITIALIZING OUTLAWZ HUD // BATTMOD V3.8",
     "FULL HD 1080P COMPOSITION ENGINE ARMED",
-    "AUDIO ANALYZER MATRIX READY",
+    "AUTO-GAIN CONTROL (AGC) NORMALIZER ACTIVE",
     "SECURE ICECAST DECODER STANDBY",
     "DUAL-MODE CAPTURE ENGINE: AUDIO + VIDEO ACTIVE",
   ]);
@@ -201,6 +190,7 @@ export function Deck() {
   const [busyId, setBusyId] = useState<string | null>(null);
 
   // Refs
+  const deckRef = useRef<HTMLDivElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const libraryAudioRef = useRef<HTMLAudioElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -210,6 +200,7 @@ export function Deck() {
   const volumeRef = useRef(0.9);
   const [volume, setVolume] = useState(0.9);
   const [isMuted, setIsMuted] = useState(false);
+  const isMutedRef = useRef(false);
   const preMuteVolume = useRef(0.9);
 
   const tracksRef = useRef<TrackMark[]>([]);
@@ -217,7 +208,10 @@ export function Deck() {
   const stationRef = useRef(station);
   const startedRef = useRef(0);
   const recordingRef = useRef(false);
+  const armingRef = useRef(false);
+  const agcEnabledRef = useRef(true);
   const libraryUrl = useRef<string | null>(null);
+  const playingUrlTake = useRef<string | null>(null);
   const vinylAngleRef = useRef(0);
   const lastFrameTimeRef = useRef(performance.now());
   const lastStateUpdateRef = useRef(0);
@@ -225,6 +219,23 @@ export function Deck() {
   useEffect(() => {
     recordModeRef.current = recordMode;
   }, [recordMode]);
+
+  useEffect(() => {
+    isMutedRef.current = isMuted;
+  }, [isMuted]);
+
+  useEffect(() => {
+    armingRef.current = arming;
+  }, [arming]);
+
+  useEffect(() => {
+    agcEnabledRef.current = agcEnabled;
+    const audio = audioRef.current as (HTMLAudioElement & { __graph?: AudioGraph }) | null;
+    if (audio?.__graph) {
+      setGraphAgcEnabled(audio.__graph, agcEnabled);
+      setAgcMode(audio.__graph.mode);
+    }
+  }, [agcEnabled]);
 
   const appendLog = (msg: string) => {
     const time = new Date().toLocaleTimeString("en-GB", { hour12: false });
@@ -407,10 +418,17 @@ export function Deck() {
         vinylAngleRef.current += dt * 1.8;
       }
 
-      let graph: Graph | null = null;
+      let graph: AudioGraph | null = null;
       if (isLive && audio) {
-        graph = attachAnalyser(audio);
-        if (graph?.ctx.state === "suspended") void graph.ctx.resume();
+        graph = attachAudioGraph(audio, volumeRef.current, isMutedRef.current, (mode) => {
+          setAgcMode(mode);
+          appendLog(`AGC_ENGINE: ${mode.toUpperCase()} NORMALIZER READY`);
+        });
+        if (graph) {
+          setGraphAgcEnabled(graph, agcEnabledRef.current);
+          if (graph.ctx.state === "suspended") void graph.ctx.resume();
+          stepAnalyserAgc(graph, dt);
+        }
       }
 
       let curBass = 0.2;
@@ -447,6 +465,8 @@ export function Deck() {
           setMidLevel(curMid);
           setTrebleLevel(curTreble);
           setPeakDb(curPeakStr);
+          setAgcGainDb(graph.currentGainDb);
+          setAgcMode(graph.mode);
         }
       }
 
@@ -518,17 +538,29 @@ export function Deck() {
     if (!audio) return;
     stopLibraryPlayback();
     audio.crossOrigin = "anonymous";
-    audio.volume = isMuted ? 0 : volumeRef.current;
-    if (audio.src !== next.streamUrl) audio.src = next.streamUrl;
-    const graph = attachAnalyser(audio);
-    if (graph?.ctx.state === "suspended") await graph.ctx.resume();
+    if (audio.src !== next.streamUrl || audio.error || audio.networkState === HTMLMediaElement.NETWORK_NO_SOURCE) {
+      audio.src = next.streamUrl;
+      audio.load();
+    }
+    const graph = attachAudioGraph(audio, volumeRef.current, isMutedRef.current, (mode) => {
+      setAgcMode(mode);
+    });
+    if (graph) {
+      setGraphAgcEnabled(graph, agcEnabledRef.current);
+      setGraphMonitorVolume(graph, volumeRef.current, isMutedRef.current);
+      if (graph.ctx.state === "suspended") void graph.ctx.resume();
+    } else {
+      audio.volume = isMutedRef.current ? 0 : volumeRef.current;
+    }
     await audio.play();
     setListening(true);
+    setError(null);
     appendLog(`MONITOR_STREAMING: ${next.name}`);
   }
 
   async function onListen() {
     setError(null);
+    setNotice(null);
     if (soundFx) playCyberSfx("click");
     if (listening) {
       stopMonitor();
@@ -536,8 +568,10 @@ export function Deck() {
     }
     try {
       await startMonitor(station);
-    } catch {
-      setError("Playback blocked. Tap Listen again, or check stream availability.");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Playback blocked";
+      appendLog(`MONITOR_BLOCKED: ${msg}`);
+      setError("Playback blocked. Tap MONITOR LIVE again, or check stream availability.");
       setListening(false);
     }
   }
@@ -576,7 +610,7 @@ export function Deck() {
       try {
         await startMonitor(current);
       } catch {
-        setNotice("Capturing stream in silent background mode.");
+        setNotice("Capturing stream in silent background mode. Tap MONITOR LIVE to hear playback.");
       }
     }
 
@@ -679,10 +713,17 @@ export function Deck() {
       return;
     }
 
-    // Capture synchronized audio from Web Audio destination node
+    // Capture synchronized normalized audio from Web Audio destination node (post-AGC, pre-monitor-volume)
     const audio = audioRef.current;
-    const graph = audio ? attachAnalyser(audio) : null;
-    if (graph?.ctx.state === "suspended") await graph.ctx.resume();
+    const graph = audio
+      ? attachAudioGraph(audio, volumeRef.current, isMutedRef.current, (mode) => {
+          setAgcMode(mode);
+        })
+      : null;
+    if (graph) {
+      setGraphAgcEnabled(graph, agcEnabledRef.current);
+      if (graph.ctx.state === "suspended") await graph.ctx.resume();
+    }
     const audioTrack = graph?.streamDest.stream.getAudioTracks()[0];
 
     const tracks: MediaStreamTrack[] = [...canvasStream.getVideoTracks()];
@@ -940,23 +981,106 @@ export function Deck() {
   function onVolume(next: number) {
     volumeRef.current = next;
     setVolume(next);
-    if (isMuted && next > 0) setIsMuted(false);
-    if (audioRef.current) audioRef.current.volume = next;
+    const nextMuted = isMutedRef.current && next > 0 ? false : isMutedRef.current;
+    if (isMutedRef.current && next > 0) {
+      setIsMuted(false);
+      isMutedRef.current = false;
+    }
+    const audio = audioRef.current as (HTMLAudioElement & { __graph?: AudioGraph }) | null;
+    if (audio?.__graph) {
+      setGraphMonitorVolume(audio.__graph, next, nextMuted);
+    } else if (audio) {
+      audio.volume = next;
+    }
     if (libraryAudioRef.current) libraryAudioRef.current.volume = next;
   }
 
   function toggleMute() {
     if (soundFx) playCyberSfx("click");
-    if (isMuted) {
+    const audio = audioRef.current as (HTMLAudioElement & { __graph?: AudioGraph }) | null;
+    if (isMutedRef.current) {
       setIsMuted(false);
-      onVolume(preMuteVolume.current);
+      isMutedRef.current = false;
+      const restored = preMuteVolume.current > 0 ? preMuteVolume.current : 0.9;
+      onVolume(restored);
+      appendLog(`AUDIO_UNMUTED (${Math.round(restored * 100)}%)`);
     } else {
-      preMuteVolume.current = volume;
+      preMuteVolume.current = volumeRef.current;
       setIsMuted(true);
-      if (audioRef.current) audioRef.current.volume = 0;
+      isMutedRef.current = true;
+      if (audio?.__graph) {
+        setGraphMonitorVolume(audio.__graph, volumeRef.current, true);
+      } else if (audio) {
+        audio.volume = 0;
+      }
       if (libraryAudioRef.current) libraryAudioRef.current.volume = 0;
+      appendLog("AUDIO_MUTED");
     }
   }
+
+  // Keep latest shortcut handlers in refs so global keydown listener stays stable
+  const onListenActionRef = useRef(onListen);
+  onListenActionRef.current = onListen;
+  const toggleMuteActionRef = useRef(toggleMute);
+  toggleMuteActionRef.current = toggleMute;
+
+  // Global keyboard shortcuts scoped to the radio player:
+  // Space -> Play/Pause | M -> Mute | R -> Toggle Audio/Video recording mode
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.defaultPrevented) return;
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      if (e.repeat) return;
+
+      const target = e.target as HTMLElement | null;
+      if (target) {
+        const tag = target.tagName;
+        if (
+          tag === "INPUT" ||
+          tag === "TEXTAREA" ||
+          tag === "SELECT" ||
+          tag === "OPTION" ||
+          target.isContentEditable
+        ) {
+          return;
+        }
+        // Preserve native browser controls on audio/video tags
+        if (tag === "VIDEO" || tag === "AUDIO") {
+          return;
+        }
+        // Scope to the application container or document body
+        const insideApp =
+          target === document.body ||
+          target === document.documentElement ||
+          Boolean(deckRef.current?.contains(target));
+        if (!insideApp) return;
+
+        // Preserve native Space activation for focused buttons/links
+        if (e.code === "Space" && target.closest('button, a, summary, [role="button"]')) {
+          return;
+        }
+      }
+
+      const key = e.key.toLowerCase();
+      if (e.code === "Space" || e.key === " ") {
+        e.preventDefault();
+        void onListenActionRef.current();
+      } else if (key === "m") {
+        e.preventDefault();
+        toggleMuteActionRef.current();
+      } else if (key === "r") {
+        if (recordingRef.current || armingRef.current) return;
+        e.preventDefault();
+        const nextMode = recordModeRef.current === "audio" ? "video" : "audio";
+        setRecordMode(nextMode);
+        if (soundFx) playCyberSfx("click");
+        appendLog(`CAPTURE_MODE_SWITCHED: ${nextMode === "video" ? "VIDEO (1080P)" : "AUDIO (MP3)"}`);
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [soundFx]);
 
   function addCustomStation() {
     if (!customName.trim() || !customUrl.trim()) return;
@@ -1036,6 +1160,7 @@ export function Deck() {
 
   return (
     <div
+      ref={deckRef}
       className={`flex flex-col gap-5 text-fg font-sans rounded-2xl transition-all duration-500 relative ${themeClasses.battlestationBg} p-2 sm:p-5`}
       suppressHydrationWarning
     >
@@ -1301,7 +1426,12 @@ export function Deck() {
                 <span>Peak: {peakDb}</span>
               </span>
               <span className="text-white/30">•</span>
-              <span className="text-white/60">Audio Engine: Active</span>
+              <span className="flex items-center gap-1">
+                <SlidersHorizontal className="h-3.5 w-3.5" style={{ color: themeClasses.hex }} />
+                <span className={agcEnabled ? "text-emerald-400" : "text-white/50"}>
+                  AGC: {agcEnabled ? `${agcGainDb >= 0 ? "+" : ""}${agcGainDb.toFixed(1)} dB (${agcMode.toUpperCase()})` : "BYPASS"}
+                </span>
+              </span>
 
               {/* YouTube Search Button */}
               <button
@@ -1659,6 +1789,29 @@ export function Deck() {
               ))}
             </div>
 
+            {/* Auto-Gain Control Normalizer Toggle */}
+            <button
+              type="button"
+              onClick={() => {
+                setAgcEnabled((prev) => {
+                  const next = !prev;
+                  appendLog(`AGC_NORMALIZER: ${next ? "ENGAGED" : "BYPASSED"}`);
+                  return next;
+                });
+                if (soundFx) playCyberSfx("click");
+              }}
+              className={`flex items-center gap-1.5 border px-2.5 py-1.5 rounded-lg cursor-pointer transition-colors ${
+                agcEnabled
+                  ? "bg-emerald-950/30 border-emerald-500/40 text-emerald-300"
+                  : "bg-black/40 border-white/10 text-muted hover:border-white/20"
+              }`}
+              title="Real-time Auto-Gain Control (Loudness Normalization before recording)"
+              suppressHydrationWarning
+            >
+              <SlidersHorizontal className="h-3.5 w-3.5" />
+              <span className="text-[11px]">AGC {agcEnabled ? "ON" : "OFF"}</span>
+            </button>
+
             {/* Monitor Switch */}
             <label className="flex items-center gap-1.5 bg-black/40 border border-white/10 px-2.5 py-1.5 rounded-lg text-muted cursor-pointer hover:border-white/20" suppressHydrationWarning>
               <input
@@ -1689,6 +1842,23 @@ export function Deck() {
               </label>
             )}
           </div>
+        </div>
+
+        {/* Keyboard Shortcut Legend */}
+        <div className="mt-3 flex flex-wrap items-center gap-3 text-[11px] font-tech text-white/50">
+          <span className="inline-flex items-center gap-1 text-white/60">
+            <Keyboard className="h-3.5 w-3.5" style={{ color: themeClasses.hex }} />
+            <span>SHORTCUTS:</span>
+          </span>
+          <span>
+            <kbd className="px-1.5 py-0.5 rounded bg-black/60 border border-white/15 text-white/80">SPACE</kbd> Play / Pause
+          </span>
+          <span>
+            <kbd className="px-1.5 py-0.5 rounded bg-black/60 border border-white/15 text-white/80">M</kbd> Mute
+          </span>
+          <span>
+            <kbd className="px-1.5 py-0.5 rounded bg-black/60 border border-white/15 text-white/80">R</kbd> Audio / Video Mode
+          </span>
         </div>
 
         {/* Live Active Recording HUD Telemetry Strip */}
@@ -2011,7 +2181,19 @@ export function Deck() {
       </section>
 
       {/* Hidden audio tags for stream playback and tape preview */}
-      <audio ref={audioRef} preload="none" suppressHydrationWarning />
+      <audio
+        ref={audioRef}
+        preload="none"
+        onEnded={() => {
+          setListening(false);
+          appendLog("STREAM_ENDED");
+        }}
+        onError={() => {
+          setListening(false);
+          appendLog("STREAM_AUDIO_ERROR");
+        }}
+        suppressHydrationWarning
+      />
       <audio
         ref={libraryAudioRef}
         preload="none"
