@@ -104,6 +104,96 @@
   );
 }
 
+/* Cyber Battlestation Textured Background */
+/* Theme-specific Battlestation Backgrounds */
+.cyber-battlestation-gold {
+  background-color: #060709;
+  background-image: 
+    radial-gradient(circle at 50% 0%, rgba(255, 176, 31, 0.12) 0%, transparent 60%),
+    radial-gradient(circle at 100% 40%, rgba(255, 176, 31, 0.06) 0%, transparent 40%),
+    radial-gradient(circle at 0% 40%, rgba(255, 176, 31, 0.06) 0%, transparent 40%),
+    linear-gradient(rgba(255, 176, 31, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 176, 31, 0.03) 1px, transparent 1px);
+  background-size: 100% 100%, 100% 100%, 100% 100%, 36px 36px, 36px 36px;
+  background-attachment: fixed;
+}
+
+.cyber-battlestation-cyan {
+  background-color: #04080c;
+  background-image: 
+    radial-gradient(circle at 50% 0%, rgba(0, 240, 255, 0.12) 0%, transparent 60%),
+    radial-gradient(circle at 100% 40%, rgba(0, 240, 255, 0.06) 0%, transparent 40%),
+    radial-gradient(circle at 0% 40%, rgba(0, 240, 255, 0.06) 0%, transparent 40%),
+    linear-gradient(rgba(0, 240, 255, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 240, 255, 0.03) 1px, transparent 1px);
+  background-size: 100% 100%, 100% 100%, 100% 100%, 36px 36px, 36px 36px;
+  background-attachment: fixed;
+}
+
+.cyber-battlestation-purple {
+  background-color: #08040d;
+  background-image: 
+    radial-gradient(circle at 50% 0%, rgba(192, 38, 211, 0.12) 0%, transparent 60%),
+    radial-gradient(circle at 100% 40%, rgba(192, 38, 211, 0.06) 0%, transparent 40%),
+    radial-gradient(circle at 0% 40%, rgba(192, 38, 211, 0.06) 0%, transparent 40%),
+    linear-gradient(rgba(192, 38, 211, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(192, 38, 211, 0.03) 1px, transparent 1px);
+  background-size: 100% 100%, 100% 100%, 100% 100%, 36px 36px, 36px 36px;
+  background-attachment: fixed;
+}
+
+/* Honeycomb Carbon Vents */
+.cyber-honeycomb-bg {
+  background-color: rgba(10, 11, 15, 0.85);
+  background-image: 
+    radial-gradient(circle at center, rgba(255, 255, 255, 0.05) 1.5px, transparent 2px),
+    radial-gradient(circle at center, rgba(255, 255, 255, 0.03) 1px, transparent 1.5px);
+  background-size: 16px 16px, 8px 8px;
+}
+
+/* Glowing Amber/Theme Chevrons */
+.cyber-chevron {
+  display: inline-block;
+  width: 0;
+  height: 0;
+  border-top: 5px solid transparent;
+  border-bottom: 5px solid transparent;
+  border-left: 7px solid currentColor;
+  opacity: 0.8;
+}
+
+/* Dynamic Range Slider matching theme */
+input[type="range"].theme-slider-gold {
+  accent-color: #ffb01f;
+}
+
+input[type="range"].theme-slider-cyan {
+  accent-color: #00f0ff;
+}
+
+input[type="range"].theme-slider-purple {
+  accent-color: #c026d3;
+}
+
+/* Dynamic Checkbox Accent */
+input[type="checkbox"].theme-check-gold:checked {
+  background-color: #ffb01f;
+  border-color: #ffb01f;
+  accent-color: #ffb01f;
+}
+
+input[type="checkbox"].theme-check-cyan:checked {
+  background-color: #00f0ff;
+  border-color: #00f0ff;
+  accent-color: #00f0ff;
+}
+
+input[type="checkbox"].theme-check-purple:checked {
+  background-color: #c026d3;
+  border-color: #c026d3;
+  accent-color: #c026d3;
+}
+
 /* Animations */
 @keyframes cyber-scan {
   0% { transform: translateY(-100%); }
@@ -120,6 +210,11 @@
   50% { opacity: 1; filter: drop-shadow(0 0 24px currentColor); }
 }
 
+@keyframes cyber-chevron-glow {
+  0%, 100% { opacity: 0.3; transform: translateX(0); }
+  50% { opacity: 1; transform: translateX(3px); }
+}
+
 .animate-cyber-radar {
   animation: cyber-radar 12s linear infinite;
 }
@@ -131,4 +226,9 @@
 .animate-pulse-glow {
   animation: cyber-pulse-glow 2.5s ease-in-out infinite;
 }
+
+.animate-chevron-flow {
+  animation: cyber-chevron-glow 1.8s ease-in-out infinite;
+}
+
 

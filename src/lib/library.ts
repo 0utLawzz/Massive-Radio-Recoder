@@ -11,6 +11,7 @@ export type TakeMeta = {
   endedAt: number;
   bytes: number;
   tracks: TrackMark[];
+  mediaType?: "audio" | "video";
 };
 
 const DB_NAME = "massive-tape";

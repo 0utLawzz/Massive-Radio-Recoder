@@ -17,6 +17,7 @@ import {
   Plus,
   Gauge,
   Wifi,
+  Video as VideoIcon,
 } from "lucide-react";
 import { canPickSaveFile, pickSaveFile, startCapture, type CaptureReason } from "@/lib/capture";
 import { downloadBlob, formatBytes, formatDuration, recordingName } from "@/lib/format";
@@ -48,11 +49,13 @@ type PendingTake = {
   fileSaved: boolean;
   kept: boolean;
   downloaded: boolean;
+  mediaType: "audio" | "video";
 };
 
 type Graph = {
   ctx: AudioContext;
   analyser: AnalyserNode;
+  streamDest: MediaStreamAudioDestinationNode;
 };
 
 type VisualizerMode = "spectrum" | "oscilloscope" | "reactor";
@@ -119,9 +122,11 @@ function attachAnalyser(audio: HTMLAudioElement): Graph | null {
   const source = ctx.createMediaElementSource(audio);
   const analyser = ctx.createAnalyser();
   analyser.fftSize = 256;
+  const streamDest = ctx.createMediaStreamDestination();
   source.connect(analyser);
   analyser.connect(ctx.destination);
-  const graph = { ctx, analyser };
+  analyser.connect(streamDest);
+  const graph = { ctx, analyser, streamDest };
   tagged.__graph = graph;
   return graph;
 }
@@ -138,6 +143,10 @@ export function Deck() {
   const [saveDirect, setSaveDirect] = useState(false);
   const [canDirect, setCanDirect] = useState(false);
   const [soundFx, setSoundFx] = useState(true);
+
+  // Capture mode: AUDIO (MP3) or VIDEO (MP4/WEBM with live visualizer + synchronized audio)
+  const [recordMode, setRecordMode] = useState<"audio" | "video">("audio");
+  const recordModeRef = useRef<"audio" | "video">("audio");
 
   const [listening, setListening] = useState(false);
   const [recording, setRecording] = useState(false);
@@ -168,11 +177,13 @@ export function Deck() {
     "INITIALIZING OUTLAWZ HUD // BATTMOD V3.8",
     "AUDIO ANALYZER MATRIX READY",
     "SECURE ICECAST DECODER STANDBY",
+    "DUAL-MODE CAPTURE ENGINE: AUDIO + VIDEO ACTIVE",
   ]);
 
   // Saved tapes state
   const [takes, setTakes] = useState<TakeMeta[]>([]);
   const [playingId, setPlayingId] = useState<string | null>(null);
+  const [playingVideoTake, setPlayingVideoTake] = useState<{ id: string; url: string; title: string } | null>(null);
   const [confirmId, setConfirmId] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
 
@@ -181,6 +192,8 @@ export function Deck() {
   const libraryAudioRef = useRef<HTMLAudioElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const captureRef = useRef<{ stop: () => void } | null>(null);
+  const videoRecorderRef = useRef<MediaRecorder | null>(null);
+  const videoChunksRef = useRef<Blob[]>([]);
   const volumeRef = useRef(0.9);
   const [volume, setVolume] = useState(0.9);
   const [isMuted, setIsMuted] = useState(false);
@@ -193,6 +206,10 @@ export function Deck() {
   const recordingRef = useRef(false);
   const libraryUrl = useRef<string | null>(null);
   const playingUrlTake = useRef<string | null>(null);
+
+  useEffect(() => {
+    recordModeRef.current = recordMode;
+  }, [recordMode]);
 
   const appendLog = (msg: string) => {
     const time = new Date().toLocaleTimeString("en-GB", { hour12: false });
@@ -318,7 +335,8 @@ export function Deck() {
     const render = () => {
       const width = canvas.width;
       const height = canvas.height;
-      ctx2d.clearRect(0, 0, width, height);
+      ctx2d.fillStyle = "#07090e";
+      ctx2d.fillRect(0, 0, width, height);
 
       const isLive = Boolean(audio && !audio.paused && audio.src);
       let graph: Graph | null = null;
@@ -454,6 +472,37 @@ export function Deck() {
         ctx2d.stroke();
       }
 
+      // HUD Watermark and Metadata Overlay on Canvas for Video & Screen
+      ctx2d.font = "bold 11px Orbitron, sans-serif";
+      ctx2d.fillStyle = themeColors.primary;
+      ctx2d.fillText("OutLawZ™ // BE THE NAME", 12, 18);
+
+      ctx2d.font = "10px 'Share Tech Mono', monospace";
+      ctx2d.fillStyle = "rgba(255, 255, 255, 0.6)";
+      const stTitle = (stationRef.current?.name ?? "LIVE STREAM").toUpperCase();
+      const stWidth = ctx2d.measureText(stTitle).width;
+      ctx2d.fillText(stTitle, width - stWidth - 12, 18);
+
+      // Track title marquee at bottom
+      const trackText = (nowPlayingRef.current ?? stationRef.current?.tagline ?? "BROADCAST TRANSMISSION").toUpperCase();
+      ctx2d.font = "bold 11px Rajdhani, sans-serif";
+      ctx2d.fillStyle = "#ffffff";
+      ctx2d.fillText(trackText.slice(0, 52), 12, height - 10);
+
+      // Live Video Recording Indicator
+      if (recordingRef.current && recordModeRef.current === "video") {
+        const isFlash = Math.floor(Date.now() / 500) % 2 === 0;
+        if (isFlash) {
+          ctx2d.fillStyle = "#ff2a51";
+          ctx2d.beginPath();
+          ctx2d.arc(width - 95, height - 13, 4, 0, Math.PI * 2);
+          ctx2d.fill();
+          ctx2d.font = "bold 10px 'Share Tech Mono', monospace";
+          ctx2d.fillStyle = "#ff2a51";
+          ctx2d.fillText("REC VIDEO", width - 85, height - 10);
+        }
+      }
+
       frame = window.requestAnimationFrame(render);
     };
 
@@ -519,7 +568,7 @@ export function Deck() {
     }
   }
 
-  async function onRecord() {
+  async function onRecordAudio() {
     if (captureRef.current) {
       if (soundFx) playCyberSfx("stop");
       captureRef.current.stop();
@@ -570,7 +619,7 @@ export function Deck() {
     setBytes(0);
     setRecording(true);
     if (soundFx) playCyberSfx("rec");
-    appendLog(`RECORDING_ENGAGED: ${current.name}`);
+    appendLog(`AUDIO_RECORDING_ENGAGED: ${current.name} [MP3]`);
 
     const capture = startCapture({
       url: current.streamUrl,
@@ -603,10 +652,189 @@ export function Deck() {
       fileSaved: Boolean(file),
       kept: false,
       downloaded: Boolean(file),
+      mediaType: "audio",
     };
     setPending(finished);
     if (result.reason === "dropped") {
       setNotice("Live stream concluded early. Captured take is preserved.");
+    }
+  }
+
+  async function onRecordVideo() {
+    if (captureRef.current) {
+      if (soundFx) playCyberSfx("stop");
+      captureRef.current.stop();
+      appendLog("VIDEO_CAPTURE_STOP_REQUESTED");
+      return;
+    }
+    if (blocked || arming) return;
+    setError(null);
+    setNotice(null);
+    if (soundFx) playCyberSfx("arm");
+
+    const current = stationRef.current;
+    const chosenLimit = LIMITS.find((item) => item.id === limitId) ?? LIMITS[0];
+
+    // Ensure audio monitor is streaming so Web Audio graph has live audio
+    try {
+      await startMonitor(current);
+    } catch {
+      setError("Playback blocked. Tap Monitor Live, then try recording video.");
+      return;
+    }
+
+    const canvas = canvasRef.current;
+    if (!canvas) {
+      setError("Visualizer display is initializing. Please retry in a moment.");
+      return;
+    }
+
+    // Capture visualizer stream at 60 FPS
+    const canvasElement = canvas as HTMLCanvasElement & {
+      captureStream?: (fps?: number) => MediaStream;
+      mozCaptureStream?: (fps?: number) => MediaStream;
+    };
+    const canvasStream: MediaStream | null = canvasElement.captureStream
+      ? canvasElement.captureStream(60)
+      : canvasElement.mozCaptureStream
+      ? canvasElement.mozCaptureStream(60)
+      : null;
+
+    if (!canvasStream) {
+      setError("Video recording is not supported in this browser engine.");
+      return;
+    }
+
+    // Capture synchronized audio from Web Audio destination node
+    const audio = audioRef.current;
+    const graph = audio ? attachAnalyser(audio) : null;
+    if (graph?.ctx.state === "suspended") await graph.ctx.resume();
+    const audioTrack = graph?.streamDest.stream.getAudioTracks()[0];
+
+    const tracks: MediaStreamTrack[] = [...canvasStream.getVideoTracks()];
+    if (audioTrack) {
+      tracks.push(audioTrack);
+    }
+    const combinedStream = new MediaStream(tracks);
+
+    let mimeType = "video/webm";
+    if (typeof MediaRecorder !== "undefined") {
+      if (MediaRecorder.isTypeSupported("video/webm;codecs=vp9,opus")) {
+        mimeType = "video/webm;codecs=vp9,opus";
+      } else if (MediaRecorder.isTypeSupported("video/webm;codecs=vp8,opus")) {
+        mimeType = "video/webm;codecs=vp8,opus";
+      } else if (MediaRecorder.isTypeSupported("video/webm")) {
+        mimeType = "video/webm";
+      } else if (MediaRecorder.isTypeSupported("video/mp4")) {
+        mimeType = "video/mp4";
+      }
+    }
+
+    videoChunksRef.current = [];
+    let recorder: MediaRecorder;
+    try {
+      recorder = new MediaRecorder(combinedStream, { mimeType, videoBitsPerSecond: 2800000 });
+    } catch {
+      recorder = new MediaRecorder(combinedStream);
+    }
+    videoRecorderRef.current = recorder;
+
+    tracksRef.current = [];
+    if (nowPlayingRef.current) {
+      tracksRef.current = [{ t: 0, title: nowPlayingRef.current }];
+    }
+    setTrackLog([...tracksRef.current]);
+    const begun = Date.now();
+    startedRef.current = begun;
+    recordingRef.current = true;
+    setStartedAt(begun);
+    setClock(begun);
+    setBytes(0);
+    setRecording(true);
+    if (soundFx) playCyberSfx("rec");
+    appendLog(`VIDEO_RECORDING_ENGAGED: ${current.name} [${mimeType}]`);
+
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) {
+        videoChunksRef.current.push(e.data);
+        setBytes((prev) => prev + e.data.size);
+      }
+    };
+
+    let timerId: number | null = null;
+    if (chosenLimit.ms) {
+      timerId = window.setTimeout(() => {
+        if (recorder.state === "recording") {
+          recorder.stop();
+          appendLog("AUTO_LIMIT_REACHED: VIDEO_CONCLUDED");
+        }
+      }, chosenLimit.ms);
+    }
+
+    captureRef.current = {
+      stop: () => {
+        if (timerId) clearTimeout(timerId);
+        if (recorder.state === "recording") recorder.stop();
+      },
+    };
+
+    const videoPromise = new Promise<{ blob: Blob }>((resolve, reject) => {
+      recorder.onstop = () => {
+        if (timerId) clearTimeout(timerId);
+        const finalBlob = new Blob(videoChunksRef.current, { type: recorder.mimeType || mimeType });
+        resolve({ blob: finalBlob });
+      };
+      recorder.onerror = (err) => {
+        if (timerId) clearTimeout(timerId);
+        reject(err);
+      };
+    });
+
+    recorder.start(1000);
+
+    try {
+      const { blob: finalBlob } = await videoPromise;
+      captureRef.current = null;
+      videoRecorderRef.current = null;
+      recordingRef.current = false;
+      setRecording(false);
+      appendLog(`VIDEO_RECORDING_COMPLETE: ${formatBytes(finalBlob.size)}`);
+
+      if (finalBlob.size === 0) {
+        setError("No video stream data was captured.");
+        return;
+      }
+
+      const finished: PendingTake = {
+        id: crypto.randomUUID(),
+        stationId: current.id,
+        stationName: current.name,
+        startedAt: begun,
+        endedAt: Date.now(),
+        bytes: finalBlob.size,
+        tracks: [...tracksRef.current],
+        reason: "stopped",
+        blob: finalBlob,
+        fileSaved: false,
+        kept: false,
+        downloaded: false,
+        mediaType: "video",
+      };
+      setPending(finished);
+    } catch (err) {
+      captureRef.current = null;
+      videoRecorderRef.current = null;
+      recordingRef.current = false;
+      setRecording(false);
+      setError(err instanceof Error ? err.message : "Video capture failed.");
+    }
+  }
+
+  async function onRecord() {
+    if (recordMode === "video") {
+      await onRecordVideo();
+    } else {
+      await onRecordAudio();
     }
   }
 
@@ -623,22 +851,24 @@ export function Deck() {
         endedAt: pending.endedAt,
         bytes: pending.bytes,
         tracks: pending.tracks,
+        mediaType: pending.mediaType,
       };
       await saveTake(meta, pending.blob);
       setPending({ ...pending, kept: true });
       setTakes(await listTakes());
       appendLog(`TAPE_ARCHIVED: ${meta.stationName}`);
     } catch {
-      setError("Local storage full for in-browser tapes. Use 'Save MP3' directly.");
+      setError("Local storage full for in-browser tapes. Download file directly.");
     }
   }
 
   function onDownload() {
     if (!pending?.blob) return;
     if (soundFx) playCyberSfx("click");
-    downloadBlob(pending.blob, recordingName(pending.stationName, new Date(pending.startedAt)));
+    const ext = pending.mediaType === "video" ? "webm" : "mp3";
+    downloadBlob(pending.blob, recordingName(pending.stationName, new Date(pending.startedAt), ext));
     setPending({ ...pending, downloaded: true });
-    appendLog(`MP3_EXPORTED: ${pending.stationName}`);
+    appendLog(`${pending.mediaType === "video" ? "VIDEO" : "MP3"}_EXPORTED: ${pending.stationName}`);
   }
 
   function onCueSheet() {
@@ -650,6 +880,7 @@ export function Deck() {
       `Captured: ${new Date(pending.startedAt).toLocaleString()}`,
       `Duration: ${formatDuration(pending.endedAt - pending.startedAt)}`,
       `Size: ${formatBytes(pending.bytes)}`,
+      `Type: ${pending.mediaType?.toUpperCase() ?? "AUDIO"}`,
       "",
       `TRACK MARKS:`,
       ...(pending.tracks.length
@@ -664,8 +895,12 @@ export function Deck() {
 
   async function onPlayTake(meta: TakeMeta) {
     if (soundFx) playCyberSfx("click");
-    if (playingId === meta.id) {
+    if (playingId === meta.id || playingVideoTake?.id === meta.id) {
       stopLibraryPlayback();
+      if (playingVideoTake) {
+        URL.revokeObjectURL(playingVideoTake.url);
+        setPlayingVideoTake(null);
+      }
       return;
     }
     setError(null);
@@ -674,11 +909,18 @@ export function Deck() {
       stopMonitor();
       const blob = await getTakeBlob(meta.id);
       if (!blob) {
-        setError("Tape file unavailable in local cache.");
+        setError("Take file unavailable in local cache.");
         return;
       }
       stopLibraryPlayback();
       const url = URL.createObjectURL(blob);
+
+      if (meta.mediaType === "video") {
+        setPlayingVideoTake({ id: meta.id, url, title: meta.stationName });
+        appendLog(`PLAYBACK_VIDEO_TAPE: ${meta.stationName}`);
+        return;
+      }
+
       libraryUrl.current = url;
       playingUrlTake.current = meta.id;
       const audio = libraryAudioRef.current;
@@ -704,7 +946,8 @@ export function Deck() {
         setError("Tape not found.");
         return;
       }
-      downloadBlob(blob, recordingName(meta.stationName, new Date(meta.startedAt)));
+      const ext = meta.mediaType === "video" ? "webm" : "mp3";
+      downloadBlob(blob, recordingName(meta.stationName, new Date(meta.startedAt), ext));
     } finally {
       setBusyId(null);
     }
@@ -771,6 +1014,10 @@ export function Deck() {
       panelBg: "bg-[#0d0e12]/90 border-[#2a2417]",
       subPanelBg: "bg-[#15171e]/70 border-[#382d1b]",
       recBg: "bg-[#ff2a51]",
+      sliderClass: "theme-slider-gold",
+      checkClass: "theme-check-gold",
+      flankColor: "text-[#ffb01f]",
+      battlestationBg: "cyber-battlestation-gold",
       hex: "#ffb01f",
     },
     cyan: {
@@ -784,6 +1031,10 @@ export function Deck() {
       panelBg: "bg-[#040e17]/90 border-[#00384d]",
       subPanelBg: "bg-[#081a29]/70 border-[#004f6e]",
       recBg: "bg-[#ff2a51]",
+      sliderClass: "theme-slider-cyan",
+      checkClass: "theme-check-cyan",
+      flankColor: "text-[#00f0ff]",
+      battlestationBg: "cyber-battlestation-cyan",
       hex: "#00f0ff",
     },
     purple: {
@@ -797,12 +1048,33 @@ export function Deck() {
       panelBg: "bg-[#0c0617]/90 border-[#38114f]",
       subPanelBg: "bg-[#180e2b]/70 border-[#501a6f]",
       recBg: "bg-[#ff2a51]",
+      sliderClass: "theme-slider-purple",
+      checkClass: "theme-check-purple",
+      flankColor: "text-[#c026d3]",
+      battlestationBg: "cyber-battlestation-purple",
       hex: "#c026d3",
     },
   }[theme];
 
   return (
-    <div className="flex flex-col gap-5 text-fg font-sans cyber-grid-bg" suppressHydrationWarning>
+    <div className={`flex flex-col gap-5 text-fg font-sans rounded-2xl transition-all duration-500 relative ${themeClasses.battlestationBg} p-2 sm:p-5`} suppressHydrationWarning>
+      {/* Ambient Cyber Flank Chevrons (matching OutLawZ Battlestation artwork) */}
+      <div className="pointer-events-none fixed left-1.5 top-1/3 hidden 2xl:flex flex-col gap-5 z-10 opacity-60">
+        {[...Array(6)].map((_, i) => (
+          <div key={i} className="flex items-center gap-1.5">
+            <span className={`cyber-chevron ${themeClasses.flankColor} animate-chevron-flow`} style={{ animationDelay: `${i * 180}ms` }} />
+            <span className={`cyber-chevron ${themeClasses.flankColor} animate-chevron-flow`} style={{ animationDelay: `${i * 180 + 90}ms` }} />
+          </div>
+        ))}
+      </div>
+      <div className="pointer-events-none fixed right-1.5 top-1/3 hidden 2xl:flex flex-col gap-5 z-10 opacity-60 rotate-180">
+        {[...Array(6)].map((_, i) => (
+          <div key={i} className="flex items-center gap-1.5">
+            <span className={`cyber-chevron ${themeClasses.flankColor} animate-chevron-flow`} style={{ animationDelay: `${i * 180}ms` }} />
+            <span className={`cyber-chevron ${themeClasses.flankColor} animate-chevron-flow`} style={{ animationDelay: `${i * 180 + 90}ms` }} />
+          </div>
+        ))}
+      </div>
       {/* HUD Top Control Bar */}
       <header className={`rounded-xl border p-4 sm:p-5 backdrop-blur-md ${themeClasses.panelBg} ${themeClasses.hudGlow}`}>
         <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
@@ -1023,7 +1295,7 @@ export function Deck() {
             </h2>
             <div className="mt-1.5 flex flex-wrap items-center gap-3 text-xs font-tech text-muted">
               <span className="flex items-center gap-1">
-                <Gauge className="h-3.5 w-3.5 text-cyan" />
+                <Gauge className="h-3.5 w-3.5" style={{ color: themeClasses.hex }} />
                 <span className="text-white/80">{station.bitrate} kbps Icecast MP3</span>
               </span>
               <span className="text-white/30">•</span>
@@ -1036,8 +1308,46 @@ export function Deck() {
             </div>
           </div>
 
-          {/* Master Glowing RECORD CORE */}
-          <div className="flex items-center gap-4 shrink-0">
+          {/* Master Controls: Capture Mode Toggle & Glowing RECORD CORE */}
+          <div className="flex flex-col sm:flex-row items-center gap-4 shrink-0">
+            {/* Capture Mode Toggle: AUDIO (MP3) vs VIDEO (MP4/WEBM) */}
+            <div className="flex items-center gap-1 bg-black/60 border border-white/10 p-1 rounded-xl shadow-inner font-tech" suppressHydrationWarning>
+              <button
+                type="button"
+                disabled={recording}
+                onClick={() => {
+                  setRecordMode("audio");
+                  if (soundFx) playCyberSfx("click");
+                }}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-orbitron font-bold transition-all ${
+                  recordMode === "audio"
+                    ? `${themeClasses.accentBg} text-black shadow-[0_0_12px_rgba(255,255,255,0.15)]`
+                    : "text-muted hover:text-white hover:bg-white/5"
+                }`}
+                suppressHydrationWarning
+              >
+                <Radio className="h-3.5 w-3.5" />
+                <span>AUDIO (MP3)</span>
+              </button>
+              <button
+                type="button"
+                disabled={recording}
+                onClick={() => {
+                  setRecordMode("video");
+                  if (soundFx) playCyberSfx("click");
+                }}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-orbitron font-bold transition-all ${
+                  recordMode === "video"
+                    ? "bg-red-500 text-white shadow-[0_0_15px_rgba(255,42,81,0.6)]"
+                    : "text-muted hover:text-white hover:bg-white/5"
+                }`}
+                suppressHydrationWarning
+              >
+                <VideoIcon className="h-3.5 w-3.5" />
+                <span>VIDEO (MP4/WEBM)</span>
+              </button>
+            </div>
+
             <button
               type="button"
               onClick={() => void onRecord()}
@@ -1071,7 +1381,13 @@ export function Deck() {
                 />
               </div>
               <span className={`font-orbitron text-xs sm:text-sm font-black tracking-widest ${recording ? "text-red-400 animate-pulse" : themeClasses.accentText}`}>
-                {arming ? "ARMING FILE..." : recording ? "TERMINATE REC" : "ENGAGE RECORD"}
+                {arming
+                  ? "ARMING FILE..."
+                  : recording
+                  ? "TERMINATE REC"
+                  : recordMode === "video"
+                  ? "RECORD VIDEO"
+                  : "ENGAGE RECORD"}
               </span>
             </button>
           </div>
@@ -1203,7 +1519,11 @@ export function Deck() {
                 aria-label="Toggle mute"
                 suppressHydrationWarning
               >
-                {isMuted || volume === 0 ? <VolumeX className="h-4 w-4 text-red-400" /> : <Volume2 className="h-4 w-4 text-cyan" />}
+                {isMuted || volume === 0 ? (
+                  <VolumeX className="h-4 w-4 text-red-400" />
+                ) : (
+                  <Volume2 className="h-4 w-4" style={{ color: themeClasses.hex }} />
+                )}
               </button>
               <input
                 id={volumeSliderId}
@@ -1213,7 +1533,8 @@ export function Deck() {
                 step="0.05"
                 value={isMuted ? 0 : volume}
                 onChange={(e) => onVolume(parseFloat(e.target.value))}
-                className="h-1.5 w-20 sm:w-28 accent-cyan cursor-pointer"
+                className={`h-1.5 w-20 sm:w-28 cursor-pointer ${themeClasses.sliderClass}`}
+                style={{ accentColor: themeClasses.hex }}
                 aria-label="Volume"
                 suppressHydrationWarning
               />
@@ -1257,7 +1578,8 @@ export function Deck() {
                 checked={monitor}
                 disabled={recording}
                 onChange={(e) => setMonitor(e.target.checked)}
-                className="rounded border-line text-cyan focus:ring-0"
+                className={`rounded border-line focus:ring-0 ${themeClasses.checkClass}`}
+                style={{ accentColor: themeClasses.hex }}
                 suppressHydrationWarning
               />
               <span className="text-[11px]">MONITOR REC</span>
@@ -1271,7 +1593,8 @@ export function Deck() {
                   checked={saveDirect}
                   disabled={recording}
                   onChange={(e) => setSaveDirect(e.target.checked)}
-                  className="rounded border-line text-cyan focus:ring-0"
+                  className={`rounded border-line focus:ring-0 ${themeClasses.checkClass}`}
+                  style={{ accentColor: themeClasses.hex }}
                   suppressHydrationWarning
                 />
                 <span className="text-[11px]">DIRECT DISK SINK</span>
@@ -1285,10 +1608,12 @@ export function Deck() {
           <div className="mt-4 flex flex-wrap items-center justify-between rounded-lg border border-red-500/40 bg-red-950/20 px-4 py-2.5 font-tech text-xs animate-pulse">
             <div className="flex items-center gap-2.5">
               <span className="h-2.5 w-2.5 rounded-full bg-red-500 shadow-[0_0_8px_#ff2a51]" />
-              <span className="font-orbitron font-bold tracking-wider text-red-400">RECORDING ENGAGED</span>
+              <span className="font-orbitron font-bold tracking-wider text-red-400">
+                {recordMode === "video" ? "VIDEO CAPTURE ACTIVE" : "AUDIO RECORDING ACTIVE"}
+              </span>
               <span className="font-tech text-sm text-white font-mono">{formatDuration(elapsed)}</span>
               {remaining !== null && (
-                <span className="text-muted text-[11px]">({formatDuration(remaining)} auto-limit)</span>
+                <span className="text-muted text-[11px]">({formatDuration(remaining)} limit)</span>
               )}
             </div>
             <div className="flex items-center gap-3">
@@ -1371,9 +1696,13 @@ export function Deck() {
           <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
             <div>
               <div className="flex items-center gap-2">
-                <Disc className={`h-4 w-4 ${themeClasses.accentText} animate-spin`} />
-                <span className={`font-orbitron text-xs font-bold tracking-widest uppercase ${themeClasses.accentText}`}>
-                  TAKE READY FOR DISPOSITION
+                {pending.mediaType === "video" ? (
+                  <VideoIcon className="h-4 w-4 text-red-400 animate-pulse" />
+                ) : (
+                  <Disc className={`h-4 w-4 ${themeClasses.accentText} animate-spin`} />
+                )}
+                <span className={`font-orbitron text-xs font-bold tracking-widest uppercase ${pending.mediaType === "video" ? "text-red-400" : themeClasses.accentText}`}>
+                  {pending.mediaType === "video" ? "VIDEO TAKE READY FOR DISPOSITION" : "AUDIO TAKE READY FOR DISPOSITION"}
                 </span>
               </div>
               <h3 className="font-orbitron text-lg font-bold text-white mt-1">
@@ -1382,6 +1711,8 @@ export function Deck() {
               <p className="text-xs font-tech text-muted mt-1">
                 {pending.fileSaved
                   ? "Take successfully flushed straight into selected disk file."
+                  : pending.mediaType === "video"
+                  ? "Visualizer video and synchronized audio stream captured in memory. Save video to device or keep in vault."
                   : "Audio capture ready in memory. Save MP3 to device or archive in browser vault."}
               </p>
             </div>
@@ -1392,11 +1723,13 @@ export function Deck() {
                   <button
                     type="button"
                     onClick={onDownload}
-                    className={`inline-flex items-center gap-2 rounded-lg px-4 py-2 text-xs font-bold text-black ${themeClasses.accentBg} transition-transform hover:scale-105 shadow-md`}
+                    className={`inline-flex items-center gap-2 rounded-lg px-4 py-2 text-xs font-bold text-black ${
+                      pending.mediaType === "video" ? "bg-red-500 text-white" : themeClasses.accentBg
+                    } transition-transform hover:scale-105 shadow-md`}
                     suppressHydrationWarning
                   >
-                    <Download className="h-4 w-4" />
-                    <span>SAVE MP3</span>
+                    {pending.mediaType === "video" ? <VideoIcon className="h-4 w-4" /> : <Download className="h-4 w-4" />}
+                    <span>{pending.mediaType === "video" ? "SAVE VIDEO (.WEBM)" : "SAVE MP3"}</span>
                   </button>
                   <button
                     type="button"
@@ -1429,6 +1762,22 @@ export function Deck() {
               </button>
             </div>
           </div>
+
+          {/* Inline Video Playback Preview for Pending Video */}
+          {pending.mediaType === "video" && pending.blob && (
+            <div className="mt-4 pt-4 border-t border-white/10">
+              <p className="font-tech text-xs text-muted mb-2 flex items-center gap-1.5">
+                <VideoIcon className="h-3.5 w-3.5 text-red-400" />
+                <span>VIDEO PREVIEW // SYNCED AUDIO VISUALIZER</span>
+              </p>
+              <video
+                src={URL.createObjectURL(pending.blob)}
+                controls
+                playsInline
+                className="w-full max-h-64 rounded-lg bg-black border border-white/20 object-contain"
+              />
+            </div>
+          )}
         </section>
       )}
 
@@ -1443,6 +1792,35 @@ export function Deck() {
           </div>
         </div>
 
+        {/* Active Video Tape Player in Vault */}
+        {playingVideoTake && (
+          <div className="my-4 p-4 rounded-xl border-2 border-red-500/50 bg-black/95 shadow-[0_0_25px_rgba(255,42,81,0.25)]">
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center gap-2 font-orbitron text-xs font-bold text-white">
+                <VideoIcon className="h-4 w-4 text-red-400" />
+                <span>PLAYING ARCHIVED VIDEO: {playingVideoTake.title}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  URL.revokeObjectURL(playingVideoTake.url);
+                  setPlayingVideoTake(null);
+                }}
+                className="font-tech text-xs text-muted hover:text-white px-2 py-0.5 border border-white/20 rounded hover:border-white/40"
+              >
+                CLOSE VIDEO
+              </button>
+            </div>
+            <video
+              src={playingVideoTake.url}
+              controls
+              autoPlay
+              playsInline
+              className="w-full max-h-72 rounded bg-black border border-white/20 object-contain"
+            />
+          </div>
+        )}
+
         {takes.length === 0 ? (
           <div className="py-8 text-center font-tech text-muted text-xs">
             <Disc className="h-8 w-8 mx-auto text-white/20 mb-2" />
@@ -1452,13 +1830,25 @@ export function Deck() {
         ) : (
           <div className="mt-3 divide-y divide-white/10 font-tech">
             {takes.map((take) => {
-              const isPlaying = playingId === take.id;
+              const isPlaying = playingId === take.id || playingVideoTake?.id === take.id;
               const isBusy = busyId === take.id;
               const duration = take.endedAt - take.startedAt;
+              const isVideo = take.mediaType === "video";
               return (
                 <div key={take.id} className="flex flex-col sm:flex-row sm:items-center sm:justify-between py-3.5 gap-2.5">
                   <div className="min-w-0">
-                    <p className="font-orbitron text-sm font-bold text-white truncate">{take.stationName}</p>
+                    <div className="flex items-center gap-2">
+                      <p className="font-orbitron text-sm font-bold text-white truncate">{take.stationName}</p>
+                      {isVideo ? (
+                        <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-red-500/20 text-red-400 border border-red-500/40">
+                          🎬 VIDEO
+                        </span>
+                      ) : (
+                        <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-white/10 text-white/70 border border-white/20">
+                          🎵 MP3
+                        </span>
+                      )}
+                    </div>
                     <p className="text-xs text-muted mt-0.5">
                       {new Date(take.startedAt).toLocaleString()} • {formatDuration(duration)} • {formatBytes(take.bytes)}
                       {take.tracks.length > 0 && ` • ${take.tracks.length} track(s)`}
@@ -1472,13 +1862,15 @@ export function Deck() {
                       onClick={() => void onPlayTake(take)}
                       className={`inline-flex items-center gap-1.5 rounded px-3 py-1.5 font-bold transition-all ${
                         isPlaying
-                          ? `${themeClasses.accentBg} text-black shadow-[0_0_10px_currentColor]`
+                          ? isVideo
+                            ? "bg-red-500 text-white shadow-[0_0_10px_#ff2a51]"
+                            : `${themeClasses.accentBg} text-black shadow-[0_0_10px_currentColor]`
                           : "border border-white/20 text-white hover:border-white/40 bg-black/40"
                       }`}
                       suppressHydrationWarning
                     >
-                      {isPlaying ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5 fill-current" />}
-                      <span>{isPlaying ? "PAUSE" : "PLAY"}</span>
+                      {isPlaying ? <Pause className="h-3.5 w-3.5" /> : isVideo ? <VideoIcon className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5 fill-current" />}
+                      <span>{isPlaying ? "STOP" : isVideo ? "WATCH" : "PLAY"}</span>
                     </button>
 
                     <button
@@ -1489,7 +1881,7 @@ export function Deck() {
                       suppressHydrationWarning
                     >
                       <Download className="h-3.5 w-3.5" />
-                      <span>MP3</span>
+                      <span>{isVideo ? "VIDEO" : "MP3"}</span>
                     </button>
 
                     {confirmId === take.id ? (
