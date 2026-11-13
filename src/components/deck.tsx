@@ -32,9 +32,23 @@ import {
   Cpu,
   Timer,
   HardDrive,
+  CalendarClock,
+  FolderOpen,
+  Scissors,
+  Sparkles,
 } from "lucide-react";
-import { canPickSaveFile, pickSaveFile, startCapture, type CaptureReason } from "@/lib/capture";
-import { downloadBlob, formatBytes, formatDuration, recordingName } from "@/lib/format";
+import {
+  canPickDirectory,
+  canPickSaveFile,
+  pickDriveDirectory,
+  pickSaveFile,
+  startCapture,
+  writeBlobToDirectory,
+  type CaptureReason,
+  type CaptureSegment,
+  type DirectoryHandleLike,
+} from "@/lib/capture";
+import { downloadBlob, formatBytes, formatDuration, recordingName, songFilename } from "@/lib/format";
 import { deleteTake, getTakeBlob, listTakes, saveTake, type TakeMeta, type TrackMark } from "@/lib/library";
 import { fetchNowPlaying, STATIONS, type Station } from "@/lib/stations";
 import { fetchAlbumArtwork, getYouTubeSearchUrl, parseTrackMeta } from "@/lib/artwork";
@@ -146,6 +160,48 @@ function readFileAsDataUrl(file: File): Promise<string> {
   });
 }
 
+function parseHHMM(hhmm: string): { h: number; m: number } {
+  const [hStr, mStr] = hhmm.split(":");
+  const h = Math.max(0, Math.min(23, parseInt(hStr || "0", 10) || 0));
+  const m = Math.max(0, Math.min(59, parseInt(mStr || "0", 10) || 0));
+  return { h, m };
+}
+
+function computeNextScheduleWindow(startHHMM: string, stopHHMM: string, nowMs: number) {
+  const s = parseHHMM(startHHMM);
+  const e = parseHHMM(stopHHMM);
+
+  const todayStart = new Date(nowMs);
+  todayStart.setHours(s.h, s.m, 0, 0);
+
+  let todayStop = new Date(nowMs);
+  todayStop.setHours(e.h, e.m, 0, 0);
+  if (todayStop.getTime() <= todayStart.getTime()) {
+    todayStop = new Date(todayStop.getTime() + 24 * 60 * 60 * 1000);
+  }
+
+  // Check if yesterday's overnight schedule is still running right now
+  const prevStartMs = todayStart.getTime() - 24 * 60 * 60 * 1000;
+  const prevStopMs = todayStop.getTime() - 24 * 60 * 60 * 1000;
+  if (nowMs >= prevStartMs && nowMs < prevStopMs) {
+    return { startMs: prevStartMs, stopMs: prevStopMs, inWindow: true };
+  }
+
+  if (nowMs >= todayStart.getTime() && nowMs < todayStop.getTime()) {
+    return { startMs: todayStart.getTime(), stopMs: todayStop.getTime(), inWindow: true };
+  }
+
+  if (nowMs < todayStart.getTime()) {
+    return { startMs: todayStart.getTime(), stopMs: todayStop.getTime(), inWindow: false };
+  }
+
+  const nextStartMs = todayStart.getTime() + 24 * 60 * 60 * 1000;
+  const nextStopMs = todayStop.getTime() + 24 * 60 * 60 * 1000;
+  return { startMs: nextStartMs, stopMs: nextStopMs, inWindow: false };
+}
+
+type AutoSaveTarget = "vault" | "drive" | "both";
+
 type PendingTake = {
   id: string;
   stationId: string;
@@ -231,10 +287,32 @@ export function Deck() {
   const [canDirect, setCanDirect] = useState(false);
   const [soundFx, setSoundFx] = useState(true);
 
-  // Expand/Collapse metadata panel & Visualizer toggle
+  // Expand/Collapse metadata panel, Visualizer toggle & Old-Fashioned Music Lights
   const [detailsExpanded, setDetailsExpanded] = useState(false);
   const [visualizerEnabled, setVisualizerEnabled] = useState(true);
   const visualizerEnabledRef = useRef(true);
+  const [musicLightsEnabled, setMusicLightsEnabled] = useState(true);
+  const musicLightsEnabledRef = useRef(true);
+
+  // Recording Scheduler State (Settings Tab)
+  const [scheduleEnabled, setScheduleEnabled] = useState(false);
+  const [scheduleStart, setScheduleStart] = useState("20:00");
+  const [scheduleStop, setScheduleStop] = useState("21:00");
+  const [scheduleFormat, setScheduleFormat] = useState<"audio" | "video">("audio");
+  const [scheduleNow, setScheduleNow] = useState(0);
+  const scheduledStopAtRef = useRef<number | null>(null);
+  const lastTriggeredStartRef = useRef<number | null>(null);
+
+  // Auto-Save on Track Change (Split Each Song Separately to Local Vault / Attached Drive)
+  const [autoSplitTracks, setAutoSplitTracks] = useState(false);
+  const [autoSaveTarget, setAutoSaveTarget] = useState<AutoSaveTarget>("both");
+  const [canPickDir, setCanPickDir] = useState(false);
+  const [driveFolderName, setDriveFolderName] = useState<string | null>(null);
+  const [autoSavedCount, setAutoSavedCount] = useState(0);
+  const [lastAutoSavedSong, setLastAutoSavedSong] = useState<string | null>(null);
+  const autoSplitTracksRef = useRef(false);
+  const autoSaveTargetRef = useRef<AutoSaveTarget>("both");
+  const driveDirHandleRef = useRef<DirectoryHandleLike | null>(null);
 
   // Custom Record Button Logo & Custom Background Image
   const [selectedLogoId, setSelectedLogoId] = useState<string>("auto");
@@ -275,6 +353,7 @@ export function Deck() {
   const [bassLevel, setBassLevel] = useState(0.2);
   const [midLevel, setMidLevel] = useState(0.2);
   const [trebleLevel, setTrebleLevel] = useState(0.2);
+  const [kickPulse, setKickPulse] = useState(0);
   const [vizMode, setVizMode] = useState<VisualizerMode>("spectrum");
   const [agcEnabled, setAgcEnabled] = useState(true);
   const [agcMode, setAgcMode] = useState<AgcMode>("worklet");
@@ -306,7 +385,11 @@ export function Deck() {
   const audioRef = useRef<HTMLAudioElement>(null);
   const libraryAudioRef = useRef<HTMLAudioElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const captureRef = useRef<{ stop: () => void } | null>(null);
+  const captureRef = useRef<{
+    stop: () => void;
+    flushSegment?: () => CaptureSegment | null;
+    splitVideo?: (completedTitle: string) => void;
+  } | null>(null);
   const videoRecorderRef = useRef<MediaRecorder | null>(null);
   const videoChunksRef = useRef<Blob[]>([]);
   const volumeRef = useRef(0.9);
@@ -327,6 +410,8 @@ export function Deck() {
   const vinylAngleRef = useRef(0);
   const lastFrameTimeRef = useRef(performance.now());
   const lastStateUpdateRef = useRef(0);
+  const kickEnvelopeRef = useRef(0);
+  const prevKickEnergyRef = useRef(0);
 
   // Hydration-safe restoration of user visual preferences from localStorage
   useEffect(() => {
@@ -349,6 +434,23 @@ export function Deck() {
         const parsed = parseFloat(savedOpacity);
         if (!Number.isNaN(parsed)) setBgOpacity(Math.max(0.1, Math.min(0.85, parsed)));
       }
+
+      const savedAutoSplit = window.localStorage.getItem("outlawz_auto_split");
+      if (savedAutoSplit === "true") setAutoSplitTracks(true);
+
+      const savedTarget = window.localStorage.getItem("outlawz_auto_target");
+      if (savedTarget === "vault" || savedTarget === "drive" || savedTarget === "both") {
+        setAutoSaveTarget(savedTarget);
+      }
+
+      const savedSchedStart = window.localStorage.getItem("outlawz_sched_start");
+      if (savedSchedStart) setScheduleStart(savedSchedStart);
+      const savedSchedStop = window.localStorage.getItem("outlawz_sched_stop");
+      if (savedSchedStop) setScheduleStop(savedSchedStop);
+      const savedSchedFmt = window.localStorage.getItem("outlawz_sched_fmt");
+      if (savedSchedFmt === "audio" || savedSchedFmt === "video") setScheduleFormat(savedSchedFmt);
+      const savedLights = window.localStorage.getItem("outlawz_music_lights");
+      if (savedLights === "false") setMusicLightsEnabled(false);
     } catch {
       // Ignore storage access errors
     }
@@ -379,12 +481,37 @@ export function Deck() {
   }, [bgOpacity]);
 
   useEffect(() => {
+    try {
+      window.localStorage.setItem("outlawz_auto_split", String(autoSplitTracks));
+      window.localStorage.setItem("outlawz_auto_target", autoSaveTarget);
+      window.localStorage.setItem("outlawz_sched_start", scheduleStart);
+      window.localStorage.setItem("outlawz_sched_stop", scheduleStop);
+      window.localStorage.setItem("outlawz_sched_fmt", scheduleFormat);
+      window.localStorage.setItem("outlawz_music_lights", String(musicLightsEnabled));
+    } catch {
+      // Ignore
+    }
+  }, [autoSplitTracks, autoSaveTarget, scheduleStart, scheduleStop, scheduleFormat, musicLightsEnabled]);
+
+  useEffect(() => {
     recordModeRef.current = recordMode;
   }, [recordMode]);
 
   useEffect(() => {
     visualizerEnabledRef.current = visualizerEnabled;
   }, [visualizerEnabled]);
+
+  useEffect(() => {
+    musicLightsEnabledRef.current = musicLightsEnabled;
+  }, [musicLightsEnabled]);
+
+  useEffect(() => {
+    autoSplitTracksRef.current = autoSplitTracks;
+  }, [autoSplitTracks]);
+
+  useEffect(() => {
+    autoSaveTargetRef.current = autoSaveTarget;
+  }, [autoSaveTarget]);
 
   useEffect(() => {
     isMutedRef.current = isMuted;
@@ -433,6 +560,7 @@ export function Deck() {
 
   useEffect(() => {
     setCanDirect(canPickSaveFile());
+    setCanPickDir(canPickDirectory());
   }, []);
 
   useEffect(() => {
@@ -441,7 +569,81 @@ export function Deck() {
     };
   }, []);
 
-  // Poll now playing
+  // Save a separated song segment to Local Vault and/or Attached Drive
+  const saveSeparatedSong = async (
+    songTitle: string,
+    blob: Blob,
+    segStartedAt: number,
+    segEndedAt: number,
+    mediaType: "audio" | "video",
+  ) => {
+    if (!blob || blob.size === 0) return;
+    const current = stationRef.current;
+    const ext = mediaType === "video" ? (blob.type.includes("mp4") ? "mp4" : "webm") : "mp3";
+    const filename = songFilename(songTitle, new Date(segStartedAt), ext);
+    const target = autoSaveTargetRef.current;
+
+    const savedLocations: string[] = [];
+
+    if (target === "vault" || target === "both") {
+      try {
+        const meta: TakeMeta = {
+          id: crypto.randomUUID(),
+          stationId: current.id,
+          stationName: current.name,
+          trackTitle: songTitle,
+          startedAt: segStartedAt,
+          endedAt: segEndedAt,
+          bytes: blob.size,
+          tracks: [{ t: 0, title: songTitle }],
+          mediaType,
+        };
+        await saveTake(meta, blob);
+        setTakes(await listTakes());
+        savedLocations.push("LOCAL VAULT");
+      } catch {
+        appendLog(`AUTO_SAVE_VAULT_FULL: ${songTitle}`);
+      }
+    }
+
+    if (target === "drive" || target === "both") {
+      if (driveDirHandleRef.current) {
+        try {
+          await writeBlobToDirectory(driveDirHandleRef.current, filename, blob);
+          savedLocations.push(`DRIVE (${driveDirHandleRef.current.name})`);
+        } catch {
+          downloadBlob(blob, filename);
+          savedLocations.push("DOWNLOADS FALLBACK");
+        }
+      } else {
+        downloadBlob(blob, filename);
+        savedLocations.push("DOWNLOADS");
+      }
+    }
+
+    setAutoSavedCount((prev) => prev + 1);
+    setLastAutoSavedSong(songTitle);
+    appendLog(`SONG_SAVED [${savedLocations.join(" + ")}]: ${filename} (${formatBytes(blob.size)})`);
+  };
+
+  const saveSeparatedSongRef = useRef(saveSeparatedSong);
+  saveSeparatedSongRef.current = saveSeparatedSong;
+
+  async function selectAttachedDrive() {
+    if (soundFx) playCyberSfx("click");
+    setError(null);
+    try {
+      const dir = await pickDriveDirectory();
+      driveDirHandleRef.current = dir;
+      setDriveFolderName(dir.name);
+      appendLog(`ATTACHED_DRIVE_MOUNTED: ${dir.name}`);
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return;
+      setError(err instanceof Error ? err.message : "Could not attach drive folder.");
+    }
+  }
+
+  // Poll now playing (5s cadence when recording with auto-split enabled, 15s otherwise)
   useEffect(() => {
     let alive = true;
     const pull = async () => {
@@ -454,6 +656,17 @@ export function Deck() {
           const list = tracksRef.current;
           const last = list[list.length - 1];
           if (!last || last.title !== title) {
+            // Auto-save previous completed song separately if Auto-Split is active
+            if (last && autoSplitTracksRef.current) {
+              if (recordModeRef.current === "audio" && captureRef.current?.flushSegment) {
+                const seg = captureRef.current.flushSegment();
+                if (seg && seg.bytes > 0) {
+                  void saveSeparatedSongRef.current(last.title, seg.blob, seg.startedAt, seg.endedAt, "audio");
+                }
+              } else if (recordModeRef.current === "video" && captureRef.current?.splitVideo) {
+                captureRef.current.splitVideo(last.title);
+              }
+            }
             const mark = { t: Math.max(0, Date.now() - startedRef.current), title };
             list.push(mark);
             setTrackLog([...list]);
@@ -468,12 +681,13 @@ export function Deck() {
       }
     };
     void pull();
-    const id = window.setInterval(() => void pull(), 15000);
+    const intervalMs = recording && autoSplitTracks ? 5000 : 15000;
+    const id = window.setInterval(() => void pull(), intervalMs);
     return () => {
       alive = false;
       window.clearInterval(id);
     };
-  }, [stationId]);
+  }, [stationId, recording, autoSplitTracks]);
 
   // Automatic Artwork Lookup via iTunes API
   useEffect(() => {
@@ -656,8 +870,8 @@ export function Deck() {
     if (!ctx2d) return;
 
     let frame = 0;
-    const freqBins = new Uint8Array(128);
-    const timeDomainBins = new Uint8Array(128);
+    const freqBins = new Uint8Array(256);
+    const timeDomainBins = new Uint8Array(256);
 
     lastFrameTimeRef.current = performance.now();
 
@@ -687,23 +901,35 @@ export function Deck() {
       let curBass = 0.2;
       let curMid = 0.2;
       let curTreble = 0.2;
+      let curKickPulse = 0;
       let curPeakStr = "-∞";
 
       if (graph && isLive) {
         graph.analyser.getByteFrequencyData(freqBins);
         graph.analyser.getByteTimeDomainData(timeDomainBins);
 
-        let bSum = 0;
+        // Tight sub-bass & kick punch detection (bins 0..3 cover ~0-375Hz, heavily weighted to kick fundamentals)
+        const b0 = (freqBins[0] || 0) / 255;
+        const b1 = (freqBins[1] || 0) / 255;
+        const b2 = (freqBins[2] || 0) / 255;
+        const b3 = (freqBins[3] || 0) / 255;
+        const kickInstant = Math.min(1, b0 * 0.36 + b1 * 0.36 + b2 * 0.18 + b3 * 0.1);
+        const kickDelta = Math.max(0, kickInstant - prevKickEnergyRef.current);
+        prevKickEnergyRef.current = prevKickEnergyRef.current * 0.76 + kickInstant * 0.24;
+
+        const kickTarget = Math.min(1, kickDelta * 3.1 + Math.max(0, kickInstant - 0.32) * 1.2);
+        kickEnvelopeRef.current = Math.max(kickTarget, kickEnvelopeRef.current * Math.pow(0.012, dt));
+        curKickPulse = kickEnvelopeRef.current;
+
         let mSum = 0;
         let tSum = 0;
-        for (let i = 0; i < 40; i++) {
-          if (i < 8) bSum += freqBins[i] || 0;
-          else if (i < 24) mSum += freqBins[i] || 0;
+        for (let i = 4; i < 64; i++) {
+          if (i < 24) mSum += freqBins[i] || 0;
           else tSum += freqBins[i] || 0;
         }
-        curBass = Math.min(1, bSum / 8 / 255);
-        curMid = Math.min(1, mSum / 16 / 255);
-        curTreble = Math.min(1, tSum / 16 / 255);
+        curBass = Math.min(1, Math.max(kickInstant, curKickPulse * 0.88));
+        curMid = Math.min(1, mSum / 20 / 255);
+        curTreble = Math.min(1, tSum / 40 / 255);
 
         const peak = Math.max(...freqBins);
         if (peak > 0) {
@@ -711,16 +937,21 @@ export function Deck() {
           curPeakStr = `${db} dBFS`;
         }
 
-        if (timeNow - lastStateUpdateRef.current > 200) {
+        if (timeNow - lastStateUpdateRef.current > 65) {
           lastStateUpdateRef.current = timeNow;
           setBassLevel(curBass);
           setMidLevel(curMid);
           setTrebleLevel(curTreble);
+          setKickPulse(curKickPulse);
           setPeakDb(curPeakStr);
           setAgcGainDb(graph.currentGainDb);
           setAgcMode(graph.mode);
           setSampleRate(graph.ctx.sampleRate);
         }
+      } else if (kickEnvelopeRef.current > 0.005) {
+        kickEnvelopeRef.current = 0;
+        prevKickEnergyRef.current = 0;
+        setKickPulse(0);
       }
 
       const parsed = parseTrackMeta(nowPlayingRef.current ?? stationRef.current?.name);
@@ -733,6 +964,7 @@ export function Deck() {
         timeDomainBins,
         isLive,
         visualizerEnabled: visualizerEnabledRef.current,
+        musicLightsEnabled: musicLightsEnabledRef.current,
         theme,
         vizMode,
         artist: parsed.artist,
@@ -749,6 +981,7 @@ export function Deck() {
         bassLevel: curBass,
         midLevel: curMid,
         trebleLevel: curTreble,
+        kickPulse: curKickPulse,
       });
 
       frame = window.requestAnimationFrame(render);
@@ -899,8 +1132,9 @@ export function Deck() {
       limitMs: chosenLimit.ms,
       onBytes: (nextBytes) => setBytes(nextBytes),
     });
-    captureRef.current = { stop: capture.stop };
+    captureRef.current = { stop: capture.stop, flushSegment: capture.flushSegment };
     const result = await capture.promise;
+    const remainingSeg = !file && autoSplitTracksRef.current ? capture.flushSegment() : null;
     captureRef.current = null;
     recordingRef.current = false;
     setRecording(false);
@@ -910,6 +1144,17 @@ export function Deck() {
     if (result.bytes === 0) {
       setError(result.error ?? "No stream data was captured. Ensure stream is online.");
       return;
+    }
+
+    if (remainingSeg && remainingSeg.bytes > 0) {
+      const lastTrackTitle = tracksRef.current[tracksRef.current.length - 1]?.title || current.name;
+      await saveSeparatedSongRef.current(
+        lastTrackTitle,
+        remainingSeg.blob,
+        remainingSeg.startedAt,
+        remainingSeg.endedAt,
+        "audio",
+      );
     }
 
     const finished: PendingTake = {
@@ -1005,43 +1250,67 @@ export function Deck() {
       }
     }
 
-    videoChunksRef.current = [];
-    let recorder: MediaRecorder;
-    try {
-      recorder = new MediaRecorder(combinedStream, { mimeType, videoBitsPerSecond: 6000000 });
-    } catch {
-      recorder = new MediaRecorder(combinedStream);
-    }
-    videoRecorderRef.current = recorder;
-
     tracksRef.current = [];
     if (nowPlayingRef.current) {
       tracksRef.current = [{ t: 0, title: nowPlayingRef.current }];
     }
     setTrackLog([...tracksRef.current]);
-    const begun = Date.now();
-    startedRef.current = begun;
+    const sessionStart = Date.now();
+    startedRef.current = sessionStart;
     recordingRef.current = true;
-    setStartedAt(begun);
-    setClock(begun);
+    setStartedAt(sessionStart);
+    setClock(sessionStart);
     setBytes(0);
     setLastSessionDurationMs(0);
     setRecording(true);
     if (soundFx) playCyberSfx("rec");
-    appendLog(`VIDEO_RECORDING_ENGAGED: 1080P FULL HD // [${recorder.mimeType || mimeType}]`);
+    appendLog(`VIDEO_RECORDING_ENGAGED: 1080P FULL HD // [${mimeType}]`);
 
-    recorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) {
-        videoChunksRef.current.push(e.data);
-        setBytes((prev) => prev + e.data.size);
-      }
-    };
+    let totalSessionBytes = 0;
+    let userStopped = false;
+    let limitTimerId: number | null = null;
+    let activeRecorder: MediaRecorder | null = null;
+    let activeSplitTitle: string | null = null;
+    let lastBlob: Blob | null = null;
 
-    let timerId: number | null = null;
+    const recordSegment = () =>
+      new Promise<{ blob: Blob; splitTitle: string | null; startedAt: number; endedAt: number }>((resolve, reject) => {
+        const segStart = Date.now();
+        const segChunks: Blob[] = [];
+        let rec: MediaRecorder;
+        try {
+          rec = new MediaRecorder(combinedStream, { mimeType, videoBitsPerSecond: 6000000 });
+        } catch {
+          rec = new MediaRecorder(combinedStream);
+        }
+        activeRecorder = rec;
+        videoRecorderRef.current = rec;
+        videoChunksRef.current = segChunks;
+
+        rec.ondataavailable = (e) => {
+          if (e.data && e.data.size > 0) {
+            segChunks.push(e.data);
+            totalSessionBytes += e.data.size;
+            setBytes(totalSessionBytes);
+          }
+        };
+
+        rec.onstop = () => {
+          const finalBlob = new Blob(segChunks, { type: rec.mimeType || mimeType });
+          const titleToSplit = activeSplitTitle;
+          activeSplitTitle = null;
+          resolve({ blob: finalBlob, splitTitle: titleToSplit, startedAt: segStart, endedAt: Date.now() });
+        };
+
+        rec.onerror = (err) => reject(err);
+        rec.start(1000);
+      });
+
     if (chosenLimit.ms) {
-      timerId = window.setTimeout(() => {
-        if (recorder.state === "recording") {
-          recorder.stop();
+      limitTimerId = window.setTimeout(() => {
+        userStopped = true;
+        if (activeRecorder && activeRecorder.state === "recording") {
+          activeRecorder.stop();
           appendLog("AUTO_LIMIT_REACHED: VIDEO_CONCLUDED");
         }
       }, chosenLimit.ms);
@@ -1049,36 +1318,40 @@ export function Deck() {
 
     captureRef.current = {
       stop: () => {
-        if (timerId) clearTimeout(timerId);
-        if (recorder.state === "recording") recorder.stop();
+        userStopped = true;
+        if (limitTimerId) clearTimeout(limitTimerId);
+        if (activeRecorder && activeRecorder.state === "recording") activeRecorder.stop();
+      },
+      splitVideo: (completedTitle: string) => {
+        if (activeRecorder && activeRecorder.state === "recording") {
+          activeSplitTitle = completedTitle;
+          activeRecorder.stop();
+        }
       },
     };
 
-    const videoPromise = new Promise<{ blob: Blob }>((resolve, reject) => {
-      recorder.onstop = () => {
-        if (timerId) clearTimeout(timerId);
-        const finalBlob = new Blob(videoChunksRef.current, { type: recorder.mimeType || mimeType });
-        resolve({ blob: finalBlob });
-      };
-      recorder.onerror = (err) => {
-        if (timerId) clearTimeout(timerId);
-        reject(err);
-      };
-    });
-
-    recorder.start(1000);
-
     try {
-      const { blob: finalBlob } = await videoPromise;
+      while (!userStopped) {
+        const seg = await recordSegment();
+        lastBlob = seg.blob;
+        if (seg.splitTitle && seg.blob.size > 0) {
+          await saveSeparatedSongRef.current(seg.splitTitle, seg.blob, seg.startedAt, seg.endedAt, "video");
+        } else if (userStopped && autoSplitTracksRef.current && seg.blob.size > 0) {
+          const finalTitle = tracksRef.current[tracksRef.current.length - 1]?.title || current.name;
+          await saveSeparatedSongRef.current(finalTitle, seg.blob, seg.startedAt, seg.endedAt, "video");
+        }
+      }
+
+      if (limitTimerId) clearTimeout(limitTimerId);
       const ended = Date.now();
       captureRef.current = null;
       videoRecorderRef.current = null;
       recordingRef.current = false;
       setRecording(false);
-      setLastSessionDurationMs(Math.max(0, ended - begun));
-      appendLog(`VIDEO_RECORDING_COMPLETE: ${formatBytes(finalBlob.size)}`);
+      setLastSessionDurationMs(Math.max(0, ended - sessionStart));
+      appendLog(`VIDEO_RECORDING_COMPLETE: ${formatBytes(totalSessionBytes)}`);
 
-      if (finalBlob.size === 0) {
+      if (!lastBlob || totalSessionBytes === 0) {
         setError("No video stream data was captured.");
         return;
       }
@@ -1087,12 +1360,12 @@ export function Deck() {
         id: crypto.randomUUID(),
         stationId: current.id,
         stationName: current.name,
-        startedAt: begun,
+        startedAt: sessionStart,
         endedAt: ended,
-        bytes: finalBlob.size,
+        bytes: lastBlob.size,
         tracks: [...tracksRef.current],
         reason: "stopped",
-        blob: finalBlob,
+        blob: lastBlob,
         fileSaved: false,
         kept: false,
         downloaded: false,
@@ -1100,6 +1373,7 @@ export function Deck() {
       };
       setPending(finished);
     } catch (err) {
+      if (limitTimerId) clearTimeout(limitTimerId);
       captureRef.current = null;
       videoRecorderRef.current = null;
       recordingRef.current = false;
@@ -1227,7 +1501,10 @@ export function Deck() {
       }
       const isVideo = meta.mediaType === "video";
       const ext = isVideo ? (blob.type.includes("mp4") ? "mp4" : "webm") : "mp3";
-      downloadBlob(blob, recordingName(meta.stationName, new Date(meta.startedAt), ext));
+      const filename = meta.trackTitle
+        ? songFilename(meta.trackTitle, new Date(meta.startedAt), ext)
+        : recordingName(meta.stationName, new Date(meta.startedAt), ext);
+      downloadBlob(blob, filename);
     } finally {
       setBusyId(null);
     }
@@ -1342,6 +1619,53 @@ export function Deck() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [soundFx]);
+
+  const onRecordAudioRef = useRef(onRecordAudio);
+  onRecordAudioRef.current = onRecordAudio;
+  const onRecordVideoRef = useRef(onRecordVideo);
+  onRecordVideoRef.current = onRecordVideo;
+
+  // Recording Scheduler Loop (checks start/stop window every 1s when armed)
+  useEffect(() => {
+    if (!scheduleEnabled) {
+      scheduledStopAtRef.current = null;
+      return;
+    }
+
+    const checkSchedule = () => {
+      const now = Date.now();
+      setScheduleNow(now);
+      const win = computeNextScheduleWindow(scheduleStart, scheduleStop, now);
+
+      if (!recordingRef.current && !armingRef.current && win.inWindow && lastTriggeredStartRef.current !== win.startMs) {
+        if (scheduleFormat === "video" && activeTab !== "deck") {
+          setActiveTab("deck");
+          return;
+        }
+        lastTriggeredStartRef.current = win.startMs;
+        scheduledStopAtRef.current = win.stopMs;
+        setPending(null);
+        setRecordMode(scheduleFormat);
+        appendLog(`SCHEDULED_RECORDING_STARTED (${scheduleStart} -> ${scheduleStop})`);
+        if (scheduleFormat === "video") {
+          void onRecordVideoRef.current();
+        } else {
+          void onRecordAudioRef.current();
+        }
+        return;
+      }
+
+      if (recordingRef.current && scheduledStopAtRef.current && now >= scheduledStopAtRef.current) {
+        scheduledStopAtRef.current = null;
+        captureRef.current?.stop();
+        appendLog("SCHEDULED_RECORDING_STOPPED");
+      }
+    };
+
+    checkSchedule();
+    const id = window.setInterval(checkSchedule, 1000);
+    return () => window.clearInterval(id);
+  }, [scheduleEnabled, scheduleStart, scheduleStop, scheduleFormat, activeTab]);
 
   function addCustomStation() {
     if (!customName.trim() || !customUrl.trim()) return;
@@ -1924,6 +2248,233 @@ export function Deck() {
               </div>
             </div>
           </section>
+
+          {/* 5. Scheduled Recording (Auto-Start / Auto-Stop) */}
+          <section className={`rounded-xl border p-5 backdrop-blur-md ${themeClasses.panelBg} flex flex-col gap-4`}>
+            <div className="flex items-center justify-between border-b border-white/10 pb-3">
+              <div className="flex items-center gap-2">
+                <CalendarClock className={`h-4 w-4 ${themeClasses.accentText}`} />
+                <h2 className="font-orbitron text-sm font-bold tracking-wider uppercase text-white">
+                  SCHEDULED RECORDING (AUTO START / STOP)
+                </h2>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  const next = !scheduleEnabled;
+                  setScheduleEnabled(next);
+                  if (next) {
+                    lastTriggeredStartRef.current = null;
+                    setScheduleNow(Date.now());
+                  } else {
+                    scheduledStopAtRef.current = null;
+                  }
+                  if (soundFx) playCyberSfx("click");
+                  appendLog(`SCHEDULER: ${next ? `ARMED (${scheduleStart} - ${scheduleStop})` : "DISARMED"}`);
+                }}
+                className={`px-3 py-1.5 rounded-lg border font-tech text-xs font-bold transition-colors ${
+                  scheduleEnabled
+                    ? "bg-emerald-950/40 border-emerald-500/60 text-emerald-300 shadow-[0_0_12px_rgba(16,185,129,0.25)]"
+                    : "bg-black/40 border-white/15 text-muted hover:text-white"
+                }`}
+              >
+                {scheduleEnabled ? "SCHEDULE ARMED" : "ENABLE SCHEDULE"}
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 font-tech text-xs">
+              <label className="flex flex-col gap-1.5">
+                <span className="text-muted uppercase tracking-wider">Auto-Start Time</span>
+                <input
+                  type="time"
+                  value={scheduleStart}
+                  onChange={(e) => {
+                    setScheduleStart(e.target.value);
+                    lastTriggeredStartRef.current = null;
+                  }}
+                  className="bg-black/80 border border-white/20 rounded-lg px-3 py-2 text-white focus:border-cyan outline-none font-mono"
+                />
+              </label>
+
+              <label className="flex flex-col gap-1.5">
+                <span className="text-muted uppercase tracking-wider">Auto-Stop Time</span>
+                <input
+                  type="time"
+                  value={scheduleStop}
+                  onChange={(e) => setScheduleStop(e.target.value)}
+                  className="bg-black/80 border border-white/20 rounded-lg px-3 py-2 text-white focus:border-cyan outline-none font-mono"
+                />
+              </label>
+            </div>
+
+            <div className="font-tech text-xs">
+              <p className="text-muted uppercase tracking-wider mb-2">Scheduled Capture Format</p>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setScheduleFormat("audio");
+                    if (soundFx) playCyberSfx("click");
+                  }}
+                  className={`px-3.5 py-2 rounded-lg border font-bold transition-colors ${
+                    scheduleFormat === "audio"
+                      ? `${themeClasses.accentBg} text-black border-transparent`
+                      : "bg-black/40 border-white/15 text-muted hover:text-white"
+                  }`}
+                >
+                  AUDIO (MP3)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setScheduleFormat("video");
+                    if (soundFx) playCyberSfx("click");
+                  }}
+                  className={`px-3.5 py-2 rounded-lg border font-bold transition-colors ${
+                    scheduleFormat === "video"
+                      ? "bg-red-500 text-white border-red-400"
+                      : "bg-black/40 border-white/15 text-muted hover:text-white"
+                  }`}
+                >
+                  VIDEO (1080P)
+                </button>
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-white/10 bg-black/50 p-3 font-tech text-xs">
+              {scheduleEnabled && scheduleNow > 0 ? (
+                (() => {
+                  const win = computeNextScheduleWindow(scheduleStart, scheduleStop, scheduleNow);
+                  const diff = win.inWindow ? Math.max(0, win.stopMs - scheduleNow) : Math.max(0, win.startMs - scheduleNow);
+                  return (
+                    <div className="flex items-center justify-between gap-2">
+                      <span className={win.inWindow ? "text-emerald-400 font-bold" : themeClasses.accentText}>
+                        {win.inWindow
+                          ? `ACTIVE WINDOW (${scheduleStart} – ${scheduleStop})`
+                          : `NEXT SCHEDULED START (${scheduleStart})`}
+                      </span>
+                      <span className="font-mono text-white font-bold">
+                        {win.inWindow ? `STOP IN ${formatDuration(diff)}` : `STARTS IN ${formatDuration(diff)}`}
+                      </span>
+                    </div>
+                  );
+                })()
+              ) : (
+                <p className="text-muted">
+                  Arm the schedule to automatically engage and stop recording for {station.name} at your chosen times.
+                </p>
+              )}
+            </div>
+          </section>
+
+          {/* 6. Auto-Save Each Song on Track Change & Old-Fashioned Music Lights */}
+          <section className={`rounded-xl border p-5 backdrop-blur-md ${themeClasses.panelBg} flex flex-col gap-4`}>
+            <div className="flex items-center justify-between border-b border-white/10 pb-3">
+              <div className="flex items-center gap-2">
+                <Scissors className={`h-4 w-4 ${themeClasses.accentText}`} />
+                <h2 className="font-orbitron text-sm font-bold tracking-wider uppercase text-white">
+                  AUTO-SPLIT SONGS & MUSIC LIGHTS
+                </h2>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  const next = !autoSplitTracks;
+                  setAutoSplitTracks(next);
+                  if (soundFx) playCyberSfx("click");
+                  appendLog(`AUTO_TRACK_SPLIT: ${next ? `ENABLED (${autoSaveTarget.toUpperCase()})` : "DISABLED"}`);
+                }}
+                className={`px-3 py-1.5 rounded-lg border font-tech text-xs font-bold transition-colors ${
+                  autoSplitTracks
+                    ? "bg-emerald-950/40 border-emerald-500/60 text-emerald-300"
+                    : "bg-black/40 border-white/15 text-muted hover:text-white"
+                }`}
+              >
+                {autoSplitTracks ? "AUTO-SPLIT: ON" : "AUTO-SPLIT: OFF"}
+              </button>
+            </div>
+
+            <div className="font-tech text-xs">
+              <p className="text-muted uppercase tracking-wider mb-2">Save Destination When Song Changes</p>
+              <div className="grid grid-cols-3 gap-2">
+                {(
+                  [
+                    { id: "vault", label: "LOCAL VAULT" },
+                    { id: "drive", label: "ATTACHED DRIVE" },
+                    { id: "both", label: "BOTH" },
+                  ] as const
+                ).map((dest) => (
+                  <button
+                    key={dest.id}
+                    type="button"
+                    onClick={() => {
+                      setAutoSaveTarget(dest.id);
+                      if (soundFx) playCyberSfx("click");
+                    }}
+                    className={`px-3 py-2 rounded-lg border font-bold transition-colors ${
+                      autoSaveTarget === dest.id
+                        ? `${themeClasses.accentBg} text-black border-transparent`
+                        : "bg-black/40 border-white/15 text-muted hover:text-white"
+                    }`}
+                  >
+                    {dest.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-2 bg-black/50 border border-white/10 rounded-lg p-3 font-tech text-xs">
+              <div className="min-w-0 flex-1">
+                <p className="text-white/90 font-bold truncate">
+                  {driveFolderName ? `Mounted Drive: ${driveFolderName}` : "No External Folder Mounted"}
+                </p>
+                <p className="text-muted text-[11px] mt-0.5">
+                  {canPickDir
+                    ? "Pick any local or attached USB/external drive folder for instant per-song saving."
+                    : "Browser falls back to instant per-song file downloads when folder picker is unavailable."}
+                </p>
+              </div>
+              <button
+                type="button"
+                disabled={!canPickDir}
+                onClick={() => void selectAttachedDrive()}
+                className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border font-bold disabled:opacity-40 ${themeClasses.badgeBg}`}
+              >
+                <FolderOpen className="h-3.5 w-3.5" />
+                <span>{driveFolderName ? "CHANGE DRIVE" : "ATTACH DRIVE"}</span>
+              </button>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-white/10 font-tech text-xs">
+              <div className="text-muted">
+                <span>Songs Auto-Saved: </span>
+                <span className="text-white font-bold">{autoSavedCount}</span>
+                {lastAutoSavedSong && (
+                  <span className="block text-[11px] text-emerald-400 truncate max-w-[260px]">
+                    Last: {lastAutoSavedSong}
+                  </span>
+                )}
+              </div>
+
+              <button
+                type="button"
+                onClick={() => {
+                  const next = !musicLightsEnabled;
+                  setMusicLightsEnabled(next);
+                  if (soundFx) playCyberSfx("click");
+                  appendLog(`MUSIC_LIGHTS: ${next ? "ON" : "OFF"}`);
+                }}
+                className={`inline-flex items-center gap-2 px-3.5 py-2 rounded-lg border font-bold transition-colors ${
+                  musicLightsEnabled
+                    ? "border-amber-400/60 bg-amber-950/30 text-amber-300 shadow-[0_0_12px_rgba(255,176,31,0.25)]"
+                    : "border-white/15 bg-black/40 text-muted hover:text-white"
+                }`}
+              >
+                <Sparkles className="h-3.5 w-3.5" />
+                <span>OLD-FASHIONED LIGHTS: {musicLightsEnabled ? "ON" : "OFF"}</span>
+              </button>
+            </div>
+          </section>
         </div>
       )}
 
@@ -2302,6 +2853,30 @@ export function Deck() {
               </div>
             </div>
 
+            {/* Active Automation Status Pills (Scheduler / Auto-Split / Attached Drive) */}
+            {(scheduleEnabled || autoSplitTracks || driveFolderName) && (
+              <div className="mt-3 flex flex-wrap items-center gap-2 font-tech text-[11px]">
+                {scheduleEnabled && (
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border border-emerald-500/40 bg-emerald-950/30 text-emerald-300">
+                    <CalendarClock className="h-3 w-3" />
+                    <span>SCHED: {scheduleStart}–{scheduleStop} ({scheduleFormat.toUpperCase()})</span>
+                  </span>
+                )}
+                {autoSplitTracks && (
+                  <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border ${themeClasses.badgeBg}`}>
+                    <Scissors className="h-3 w-3" />
+                    <span>AUTO-SPLIT: {autoSaveTarget.toUpperCase()} ({autoSavedCount} SAVED)</span>
+                  </span>
+                )}
+                {driveFolderName && (
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border border-cyan-500/40 bg-cyan-950/30 text-cyan-300">
+                    <FolderOpen className="h-3 w-3" />
+                    <span>DRIVE: {driveFolderName}</span>
+                  </span>
+                )}
+              </div>
+            )}
+
             {/* 1920x1080 Responsive 16:9 Full HD D3 Canvas Stage with Cyber Scanlines */}
             <div className="mt-4 rounded-xl border border-white/10 bg-black/90 p-2 sm:p-3 relative overflow-hidden">
               <div className="flex flex-wrap items-center justify-between gap-2 mb-2 px-1">
@@ -2309,7 +2884,17 @@ export function Deck() {
                   <Activity className={`h-3.5 w-3.5 ${themeClasses.accentText}`} />
                   <span className="tracking-wider uppercase">16:9 FULL HD D3 STUDIO STAGE</span>
                   <span className="text-white/30 hidden sm:inline">•</span>
-                  <span className="text-white/50 hidden sm:inline">1920×1080 60FPS</span>
+                  <span className="inline-flex items-center gap-1.5 text-[11px] font-bold" style={{ color: kickPulse > 0.35 ? themeClasses.hex : undefined }}>
+                    <span
+                      className="h-2 w-2 rounded-full transition-transform duration-75"
+                      style={{
+                        backgroundColor: kickPulse > 0.25 ? themeClasses.hex : "rgba(255,255,255,0.25)",
+                        transform: `scale(${1 + kickPulse * 0.55})`,
+                        boxShadow: kickPulse > 0.25 ? `0 0 ${Math.round(6 + kickPulse * 12)}px ${themeClasses.hex}` : "none",
+                      }}
+                    />
+                    <span>KICK SYNC</span>
+                  </span>
                   {artworkLoading && (
                     <span className="text-cyan text-[11px] animate-pulse hidden sm:inline">// FETCHING ARTWORK...</span>
                   )}
@@ -2386,8 +2971,121 @@ export function Deck() {
                   >
                     REACTOR RADAR
                   </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setVizMode("retro-leds");
+                      if (!visualizerEnabled) setVisualizerEnabled(true);
+                      if (soundFx) playCyberSfx("click");
+                    }}
+                    className={`px-2 py-0.5 rounded border transition-colors ${
+                      vizMode === "retro-leds" && visualizerEnabled
+                        ? themeClasses.badgeBg
+                        : "border-white/10 text-muted hover:text-fg"
+                    }`}
+                    suppressHydrationWarning
+                  >
+                    RETRO LEDS
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setVizMode("horizon-bars");
+                      if (!visualizerEnabled) setVisualizerEnabled(true);
+                      if (soundFx) playCyberSfx("click");
+                    }}
+                    className={`px-2 py-0.5 rounded border transition-colors ${
+                      vizMode === "horizon-bars" && visualizerEnabled
+                        ? themeClasses.badgeBg
+                        : "border-white/10 text-muted hover:text-fg"
+                    }`}
+                    suppressHydrationWarning
+                  >
+                    HORIZON BARS
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setVizMode("disco-tunnel");
+                      if (!visualizerEnabled) setVisualizerEnabled(true);
+                      if (soundFx) playCyberSfx("click");
+                    }}
+                    className={`px-2 py-0.5 rounded border transition-colors ${
+                      vizMode === "disco-tunnel" && visualizerEnabled
+                        ? themeClasses.badgeBg
+                        : "border-white/10 text-muted hover:text-fg"
+                    }`}
+                    suppressHydrationWarning
+                  >
+                    3D TUNNEL
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setMusicLightsEnabled((prev) => !prev);
+                      if (soundFx) playCyberSfx("click");
+                    }}
+                    className={`inline-flex items-center gap-1 px-2 py-0.5 rounded border transition-colors ${
+                      musicLightsEnabled
+                        ? "border-amber-400/60 bg-amber-950/30 text-amber-300"
+                        : "border-white/10 text-muted hover:text-fg"
+                    }`}
+                    suppressHydrationWarning
+                  >
+                    <Sparkles className="h-3 w-3" />
+                    <span>LIGHTS {musicLightsEnabled ? "ON" : "OFF"}</span>
+                  </button>
                 </div>
               </div>
+
+              {/* Old-Fashioned Reactive Incandescent Music Lights Marquee */}
+              {musicLightsEnabled && (
+                <div
+                  aria-label="Old-Fashioned Music Lights"
+                  className="mb-2 px-3 py-1.5 rounded-lg bg-[#090a0f] border border-white/10 flex items-center justify-between gap-1.5 shadow-inner"
+                >
+                  {[
+                    "#ff3b5c",
+                    "#ffb01f",
+                    "#ffe600",
+                    "#39ff14",
+                    "#00f0ff",
+                    "#3b82f6",
+                    "#d946ef",
+                    "#ff3b5c",
+                    "#ffb01f",
+                    "#39ff14",
+                    "#00f0ff",
+                    "#ffe600",
+                    "#d946ef",
+                    "#3b82f6",
+                    "#ff3b5c",
+                    "#ffb01f",
+                    "#39ff14",
+                    "#00f0ff",
+                  ].map((color, idx) => {
+                    const bandEnergy = idx % 3 === 0 ? bassLevel : idx % 3 === 1 ? midLevel : trebleLevel;
+                    const kickedEnergy = Math.min(1, bandEnergy * 0.65 + kickPulse * 0.55);
+                    const activeBoost = listening || recording ? 0.3 + kickedEnergy * 0.7 : 0.32;
+                    return (
+                      <div key={idx} className="flex flex-col items-center">
+                        <span
+                          className="h-2.5 w-2.5 sm:h-3 sm:w-3 rounded-full border border-white/30 transition-all duration-75"
+                          style={{
+                            backgroundColor: color,
+                            opacity: activeBoost,
+                            transform: `scale(${0.85 + kickedEnergy * 0.45})`,
+                            boxShadow:
+                              listening || recording
+                                ? `0 0 ${Math.round(8 + kickedEnergy * 20)}px ${color}, inset 0 1px 2px rgba(255,255,255,0.85)`
+                                : `0 0 4px ${color}`,
+                          }}
+                        />
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
 
               {/* Master 1920x1080 Canvas with CSS Scanline Overlay */}
               <div className="relative rounded-lg overflow-hidden border border-white/10 shadow-2xl">
@@ -2731,7 +3429,9 @@ export function Deck() {
                     <div key={take.id} className="flex flex-col sm:flex-row sm:items-center sm:justify-between py-3.5 gap-2.5">
                       <div className="min-w-0">
                         <div className="flex items-center gap-2">
-                          <p className="font-orbitron text-sm font-bold text-white truncate">{take.stationName}</p>
+                          <p className="font-orbitron text-sm font-bold text-white truncate">
+                            {take.trackTitle || take.stationName}
+                          </p>
                           {isVideo ? (
                             <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-red-500/20 text-red-400 border border-red-500/40">
                               🎬 VIDEO 1080P
@@ -2743,6 +3443,7 @@ export function Deck() {
                           )}
                         </div>
                         <p className="text-xs text-muted mt-0.5">
+                          {take.trackTitle ? `${take.stationName} • ` : ""}
                           {new Date(take.startedAt).toLocaleString()} • {formatDuration(duration)} • {formatBytes(take.bytes)}
                           {take.tracks.length > 0 && ` • ${take.tracks.length} track(s)`}
                         </p>

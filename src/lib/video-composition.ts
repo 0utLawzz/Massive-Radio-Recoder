@@ -3,12 +3,19 @@ import * as d3 from "d3";
 /**
  * 1920x1080 Full HD (16:9) Video Composition Engine for YouTube / Video Capture.
  * Uses D3 scales & path generators on HTML5 Canvas 2D to render rotating vinyl disc
- * with artwork/badge, live reactive D3 audio visualizer (or static standby layout),
- * cyber scanline HUD overlay, track typography, and telemetry.
+ * with radial spectrum halo, live reactive D3 audio visualizers (Spectrum, Laser Wave,
+ * Reactor Radar, Retro LED Lights, Horizon Bars, 3D Light Tunnel), old-fashioned
+ * music lights bezel, cyber scanline HUD overlay, track typography, and telemetry.
  */
 
 export type BattlestationTheme = "gold" | "cyan" | "purple";
-export type VisualizerMode = "spectrum" | "oscilloscope" | "reactor";
+export type VisualizerMode =
+  | "spectrum"
+  | "oscilloscope"
+  | "reactor"
+  | "retro-leds"
+  | "horizon-bars"
+  | "disco-tunnel";
 
 export type CompositionTheme = {
   primary: string;
@@ -58,6 +65,7 @@ export type RenderCompositionOptions = {
   timeDomainBins: Uint8Array;
   isLive: boolean;
   visualizerEnabled: boolean;
+  musicLightsEnabled?: boolean;
   theme: BattlestationTheme;
   vizMode: VisualizerMode;
   artist: string;
@@ -74,7 +82,45 @@ export type RenderCompositionOptions = {
   bassLevel: number;
   midLevel: number;
   trebleLevel: number;
+  kickPulse?: number;
 };
+
+const RETRO_BULB_PALETTE = [
+  "#ff3b5c",
+  "#ffb01f",
+  "#ffe600",
+  "#39ff14",
+  "#00f0ff",
+  "#3b82f6",
+  "#d946ef",
+];
+
+/**
+ * Perceptual logarithmic frequency sampler locked to bass & kick transients so
+ * EVERY spectrum bar dances tightly in sync with kick drums and sub-bass energy.
+ */
+function sampleBandEnergy(
+  freqBins: Uint8Array,
+  normPos: number,
+  bassLevel: number,
+  midLevel: number,
+  kickPulse = 0,
+): number {
+  const maxActiveBin = Math.min(freqBins.length - 1, 150); // ~0 Hz to ~14 kHz active musical range
+  const curved = Math.pow(Math.max(0, Math.min(1, normPos)), 1.55);
+  const centerIdx = Math.floor(curved * maxActiveBin);
+  const prev = freqBins[Math.max(0, centerIdx - 1)] || 0;
+  const cur = freqBins[centerIdx] || 0;
+  const next = freqBins[Math.min(maxActiveBin, centerIdx + 1)] || 0;
+  const rawAvg = (prev * 0.25 + cur * 0.5 + next * 0.25) / 255;
+
+  // High-frequency perceptual boost + tight bass/kick pump so all bands jump on kick hits
+  const trebleGain = 1 + curved * 0.65;
+  const bassDrive = bassLevel * 0.42 + kickPulse * 0.52;
+  const bandSync = rawAvg * (trebleGain + bassDrive * 0.65);
+  const kickLift = kickPulse * (0.28 - 0.1 * normPos) + bassLevel * 0.12 + midLevel * 0.06;
+  return Math.min(1, bandSync + kickLift);
+}
 
 export function renderVideoComposition(opts: RenderCompositionOptions) {
   const {
@@ -85,6 +131,7 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
     timeDomainBins,
     isLive,
     visualizerEnabled,
+    musicLightsEnabled = true,
     theme,
     vizMode,
     artist,
@@ -100,17 +147,26 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
     bassLevel,
     midLevel,
     trebleLevel,
+    kickPulse = 0,
   } = opts;
 
   const palette = THEME_PALETTES[theme];
+  const nowMs = Date.now();
 
   // 1. Cyberpunk Studio Background (deep dark metallic slate with vignette)
   ctx.save();
   ctx.fillStyle = "#06080d";
   ctx.fillRect(0, 0, width, height);
 
-  // Radial ambient gradient flare matching theme
-  const bgGrad = ctx.createRadialGradient(width * 0.28, height * 0.5, 50, width * 0.28, height * 0.5, 800);
+  // Radial ambient gradient flare matching theme (pulses on kick)
+  const bgGrad = ctx.createRadialGradient(
+    width * 0.28,
+    height * 0.5,
+    50,
+    width * 0.28,
+    height * 0.5,
+    820 + (isLive ? kickPulse * 140 : 0),
+  );
   bgGrad.addColorStop(0, palette.bgRgba);
   bgGrad.addColorStop(1, "transparent");
   ctx.fillStyle = bgGrad;
@@ -130,6 +186,49 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
     ctx.lineTo(width, y);
   }
   ctx.stroke();
+
+  // Old-Fashioned Music Lights along top & bottom studio rails
+  if (musicLightsEnabled) {
+    const bulbCount = 30;
+    const marginX = 90;
+    const stepX = (width - marginX * 2) / (bulbCount - 1);
+    const chasePhase = Math.floor(nowMs / 150);
+
+    for (let i = 0; i < bulbCount; i++) {
+      const bx = marginX + i * stepX;
+      const bandNorm = i / (bulbCount - 1);
+      const bandVal = isLive
+        ? sampleBandEnergy(freqBins, bandNorm, bassLevel, midLevel, kickPulse)
+        : 0.25 + 0.2 * Math.sin(nowMs * 0.004 + i * 0.5);
+      const isChaseOn = (i + chasePhase) % 3 === 0;
+      const intensity = isLive
+        ? Math.min(1, 0.28 + bandVal * 0.72 + kickPulse * 0.35 + (isChaseOn ? 0.12 : 0))
+        : isChaseOn
+        ? 0.55
+        : 0.2;
+      const bulbColor = RETRO_BULB_PALETTE[i % RETRO_BULB_PALETTE.length];
+
+      for (const by of [24, height - 24]) {
+        ctx.save();
+        ctx.globalAlpha = intensity;
+        ctx.shadowColor = bulbColor;
+        ctx.shadowBlur = isLive ? 14 + bassLevel * 18 + kickPulse * 24 : 8;
+        ctx.fillStyle = bulbColor;
+        ctx.beginPath();
+        ctx.arc(bx, by, 7 + (isLive ? kickPulse * 2.5 : 0), 0, Math.PI * 2);
+        ctx.fill();
+
+        // Warm incandescent filament core
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = "#ffffff";
+        ctx.globalAlpha = intensity * 0.85;
+        ctx.beginPath();
+        ctx.arc(bx, by, 2.5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+  }
 
   // Corner HUD brackets
   const bracketSize = 32;
@@ -165,17 +264,60 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
   ctx.lineTo(width - margin, height - margin - bracketSize);
   ctx.stroke();
 
-  // 2. Rotating Vinyl Record Presentation (Left side: cx = 460, cy = 540)
+  // 2. Rotating Vinyl Record Presentation + Radial Music Ring (Left side: cx = 460, cy = 540)
   const vinylCx = 460;
   const vinylCy = height / 2;
-  const vinylRadius = 320; // 640px diameter
+  const vinylRadius = 300;
+  const kickScale = isLive ? 1 + kickPulse * 0.032 + bassLevel * 0.012 : 1;
 
   ctx.save();
   ctx.translate(vinylCx, vinylCy);
+  ctx.scale(kickScale, kickScale);
+
+  // Bass/Kick Shockwave Halo around Vinyl
+  if (isLive && kickPulse > 0.08) {
+    ctx.save();
+    ctx.strokeStyle = palette.primary;
+    ctx.globalAlpha = Math.min(0.65, kickPulse * 0.75);
+    ctx.lineWidth = 2 + kickPulse * 4;
+    ctx.beginPath();
+    ctx.arc(0, 0, vinylRadius + 24 + kickPulse * 68, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // Radial Outer Spectrum Ring around Vinyl (inspired by circular neon spectrum reference)
+  if (visualizerEnabled) {
+    const radialBars = 72;
+    const innerRingR = vinylRadius + 14;
+    for (let i = 0; i < radialBars; i++) {
+      const angle = (i / radialBars) * Math.PI * 2 - Math.PI / 2;
+      const norm = (i % (radialBars / 2)) / (radialBars / 2);
+      const energy = isLive
+        ? sampleBandEnergy(freqBins, norm, bassLevel, midLevel, kickPulse)
+        : 0.14 + 0.08 * Math.sin(nowMs * 0.003 + i * 0.35);
+      const len = 10 + energy * (76 + kickPulse * 34);
+
+      const x1 = Math.cos(angle) * innerRingR;
+      const y1 = Math.sin(angle) * innerRingR;
+      const x2 = Math.cos(angle) * (innerRingR + len);
+      const y2 = Math.sin(angle) * (innerRingR + len);
+
+      const hue = ((i / radialBars) * 300 + (nowMs * 0.02)) % 360;
+      ctx.strokeStyle = isLive ? `hsl(${hue}, 95%, 60%)` : palette.grid;
+      ctx.lineWidth = 4;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.moveTo(x1, y1);
+      ctx.lineTo(x2, y2);
+      ctx.stroke();
+    }
+    ctx.lineCap = "butt";
+  }
 
   // Vinyl outer shadow
   ctx.shadowColor = palette.glow;
-  ctx.shadowBlur = isLive ? 35 + bassLevel * 25 : 20;
+  ctx.shadowBlur = isLive ? 35 + bassLevel * 25 + kickPulse * 30 : 20;
 
   // Outer edge rim
   ctx.beginPath();
@@ -200,7 +342,7 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
 
   // Microgrooves (concentric subtle rings)
   ctx.lineWidth = 1;
-  const grooveStart = 150;
+  const grooveStart = 145;
   const grooveEnd = vinylRadius - 10;
   for (let r = grooveStart; r < grooveEnd; r += 6) {
     ctx.strokeStyle = r % 18 === 0 ? "rgba(255, 255, 255, 0.08)" : "rgba(255, 255, 255, 0.02)";
@@ -209,7 +351,7 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
     ctx.stroke();
   }
 
-  // Realistic vinyl light reflections (anisotropic sheen wedges)
+  // Realistic vinyl light reflections
   const sheenGrad1 = ctx.createLinearGradient(-vinylRadius, -vinylRadius, vinylRadius, vinylRadius);
   sheenGrad1.addColorStop(0, "rgba(255, 255, 255, 0.08)");
   sheenGrad1.addColorStop(0.5, "transparent");
@@ -219,8 +361,8 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
   ctx.arc(0, 0, vinylRadius - 8, 0, Math.PI * 2);
   ctx.fill();
 
-  // Center Vinyl Label / Album Artwork / Selected OutLawZ Badge (Radius 135px -> 270px diameter)
-  const labelRadius = 135;
+  // Center Vinyl Label / Album Artwork / Selected OutLawZ Badge
+  const labelRadius = 130;
   ctx.save();
   ctx.beginPath();
   ctx.arc(0, 0, labelRadius, 0, Math.PI * 2);
@@ -236,33 +378,24 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
   if (activeCenterImg) {
     ctx.drawImage(activeCenterImg, -labelRadius, -labelRadius, labelRadius * 2, labelRadius * 2);
 
-    // Subtle dark circular vignette on label border
     const artVignette = ctx.createRadialGradient(0, 0, labelRadius * 0.6, 0, 0, labelRadius);
     artVignette.addColorStop(0, "transparent");
     artVignette.addColorStop(1, "rgba(0, 0, 0, 0.55)");
     ctx.fillStyle = artVignette;
     ctx.fillRect(-labelRadius, -labelRadius, labelRadius * 2, labelRadius * 2);
   } else {
-    // Stylized Cyberpunk OutLawZ Default Vinyl Artwork
     const labelGrad = ctx.createRadialGradient(0, 0, 10, 0, 0, labelRadius);
     labelGrad.addColorStop(0, palette.dark);
     labelGrad.addColorStop(1, "#020406");
     ctx.fillStyle = labelGrad;
     ctx.fillRect(-labelRadius, -labelRadius, labelRadius * 2, labelRadius * 2);
 
-    // Concentric circuit rings
     ctx.strokeStyle = palette.primary;
     ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.arc(0, 0, labelRadius - 10, 0, Math.PI * 2);
     ctx.stroke();
 
-    ctx.strokeStyle = palette.grid;
-    ctx.beginPath();
-    ctx.arc(0, 0, labelRadius - 25, 0, Math.PI * 2);
-    ctx.stroke();
-
-    // OutLawZ Center Typography
     ctx.font = "bold 22px 'Orbitron', sans-serif";
     ctx.fillStyle = palette.primary;
     ctx.textAlign = "center";
@@ -276,10 +409,6 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
     ctx.font = "bold 11px 'Rajdhani', sans-serif";
     ctx.fillStyle = palette.accent;
     ctx.fillText("33⅓ RPM · STEREO", 0, 32);
-
-    ctx.font = "10px 'Share Tech Mono', monospace";
-    ctx.fillStyle = "rgba(255, 255, 255, 0.6)";
-    ctx.fillText("HI-FI BROADCAST", 0, 52);
   }
 
   ctx.restore();
@@ -291,7 +420,6 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
   ctx.arc(0, 0, labelRadius, 0, Math.PI * 2);
   ctx.stroke();
 
-  // Spindle center metal ring
   ctx.beginPath();
   ctx.arc(0, 0, 22, 0, Math.PI * 2);
   ctx.fillStyle = "#262c38";
@@ -300,7 +428,6 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
   ctx.lineWidth = 2;
   ctx.stroke();
 
-  // Center hole cutout
   ctx.beginPath();
   ctx.arc(0, 0, 10, 0, Math.PI * 2);
   ctx.fillStyle = "#06080d";
@@ -315,8 +442,7 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
   ctx.textAlign = "left";
   ctx.textBaseline = "top";
 
-  // Glowing status capsule
-  const badgeY = 160;
+  const badgeY = 148;
   ctx.fillStyle = palette.primary;
   ctx.beginPath();
   ctx.arc(infoLeft + 8, badgeY + 12, 6, 0, Math.PI * 2);
@@ -330,7 +456,7 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
   ctx.fillStyle = "rgba(255, 255, 255, 0.5)";
   ctx.fillText(`//  ${stationName.toUpperCase()}  //  ${bitrate} KBPS ICECAST`, infoLeft + 200, badgeY + 2);
 
-  // Large Track Title (Truncate cleanly if too long)
+  // Large Track Title
   const displayTitle = (title || "WAITING FOR METADATA...").trim();
   ctx.font = "bold 46px 'Orbitron', sans-serif";
   ctx.fillStyle = "#ffffff";
@@ -356,7 +482,7 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
   ctx.fillText(displayArtist.toUpperCase(), infoLeft, titleY);
 
   // Horizontal Tech Divider
-  titleY += 50;
+  titleY += 48;
   ctx.strokeStyle = "rgba(255, 255, 255, 0.15)";
   ctx.lineWidth = 1;
   ctx.beginPath();
@@ -364,14 +490,13 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
   ctx.lineTo(infoLeft + contentWidth, titleY);
   ctx.stroke();
 
-  // 4. Live D3 Audio Visualizer Box (16:9 inner module)
+  // 4. Live D3 Audio & Music Lights Visualizer Box
   const vizX = infoLeft;
-  const vizY = titleY + 30;
+  const vizY = titleY + 26;
   const vizWidth = contentWidth;
-  const vizHeight = 320;
+  const vizHeight = 350;
 
-  // Viz Box background
-  ctx.fillStyle = "rgba(10, 14, 22, 0.88)";
+  ctx.fillStyle = "rgba(7, 10, 18, 0.92)";
   ctx.strokeStyle = "rgba(255, 255, 255, 0.14)";
   ctx.lineWidth = 1.5;
   ctx.beginPath();
@@ -383,22 +508,21 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
   ctx.font = "14px 'Share Tech Mono', monospace";
   ctx.fillStyle = palette.primary;
   const modeLabel = visualizerEnabled
-    ? `D3 FREQUENCY MATRIX // MODE: ${vizMode.toUpperCase()}`
-    : "D3 FREQUENCY MATRIX // STATIC LAYOUT";
-  ctx.fillText(modeLabel, vizX + 16, vizY + 16);
+    ? `D3 SPECTRUM & KICK SYNC // MODE: ${vizMode.toUpperCase()}`
+    : "D3 SPECTRUM MATRIX // STATIC LAYOUT";
+  ctx.fillText(modeLabel, vizX + 16, vizY + 14);
 
   ctx.textAlign = "right";
-  ctx.fillStyle = "rgba(255, 255, 255, 0.6)";
-  ctx.fillText(`PEAK: ${opts.peakDb}`, vizX + vizWidth - 16, vizY + 16);
+  ctx.fillStyle = kickPulse > 0.45 && isLive ? palette.accent : "rgba(255, 255, 255, 0.65)";
+  ctx.fillText(`PEAK: ${opts.peakDb} // KICK SYNC ${Math.round(kickPulse * 100)}% // 60Hz–16kHz`, vizX + vizWidth - 16, vizY + 14);
   ctx.textAlign = "left";
 
-  // Visualizer Render Area
   const innerVizX = vizX + 16;
-  const innerVizY = vizY + 46;
+  const innerVizY = vizY + 42;
   const innerVizW = vizWidth - 32;
-  const innerVizH = vizHeight - 66;
+  const innerVizH = vizHeight - 76;
 
-  // Subtle D3 reference grid inside visualizer box
+  // D3 reference grid lines
   const yGridScale = d3.scaleLinear().domain([0, 100]).range([innerVizY + innerVizH, innerVizY]);
   ctx.strokeStyle = "rgba(255, 255, 255, 0.05)";
   ctx.lineWidth = 1;
@@ -411,7 +535,6 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
   }
 
   if (!visualizerEnabled) {
-    // Static Layout Mode (clean cyber grid + center horizon + calibration markers)
     const centerY = innerVizY + innerVizH / 2;
     ctx.strokeStyle = palette.primary;
     ctx.globalAlpha = 0.35;
@@ -422,7 +545,6 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
     ctx.stroke();
     ctx.globalAlpha = 1;
 
-    // D3 Static tick notches along baseline
     const xTicks = d3.scaleLinear().domain([0, 20]).range([innerVizX, innerVizX + innerVizW]);
     ctx.strokeStyle = palette.grid;
     ctx.lineWidth = 1.5;
@@ -439,15 +561,15 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
     ctx.textBaseline = "middle";
     ctx.font = "bold 16px 'Orbitron', sans-serif";
     ctx.fillStyle = "rgba(255, 255, 255, 0.55)";
-    ctx.fillText("VISUALIZER: STATIC HUD LAYOUT", innerVizX + innerVizW / 2, centerY - 28);
+    ctx.fillText("VISUALIZER: STATIC HUD LAYOUT", innerVizX + innerVizW / 2, centerY - 26);
     ctx.font = "12px 'Share Tech Mono', monospace";
     ctx.fillStyle = palette.primary;
-    ctx.fillText("CLICK 'TOGGLE VISUALIZER' TO ENGAGE DYNAMIC D3 WAVEFORM", innerVizX + innerVizW / 2, centerY + 30);
+    ctx.fillText("CLICK 'TOGGLE VISUALIZER' TO ENGAGE DYNAMIC D3 WAVEFORM", innerVizX + innerVizW / 2, centerY + 26);
     ctx.textAlign = "left";
     ctx.textBaseline = "top";
   } else if (isLive) {
     if (vizMode === "spectrum") {
-      // D3 ScaleBand + ScaleLinear + Theme Color Interpolator (Cyan / Gold / Purple)
+      // Full-range D3 Spectrum locked to bass & kick transients so EVERY bar jumps on the beat
       const barCount = 48;
       const indices = d3.range(barCount);
       const xScale = d3
@@ -456,7 +578,7 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
         .range([innerVizX, innerVizX + innerVizW])
         .paddingInner(0.18);
 
-      const yScale = d3.scaleLinear().domain([0, 255]).range([0, innerVizH * 0.92]);
+      const yScale = d3.scaleLinear().domain([0, 1]).range([0, innerVizH * 0.94]);
 
       const colorScale = d3
         .scaleLinear<string>()
@@ -465,33 +587,38 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
         .clamp(true);
 
       const barW = xScale.bandwidth();
-      const half = Math.floor(barCount / 2);
+
+      // Kick-sync floor glow
+      if (kickPulse > 0.12) {
+        ctx.save();
+        const floorGlow = ctx.createLinearGradient(0, innerVizY + innerVizH - 48, 0, innerVizY + innerVizH);
+        floorGlow.addColorStop(0, "transparent");
+        floorGlow.addColorStop(1, palette.glow);
+        ctx.globalAlpha = Math.min(0.85, kickPulse * 0.9);
+        ctx.fillStyle = floorGlow;
+        ctx.fillRect(innerVizX, innerVizY + innerVizH - 48, innerVizW, 48);
+        ctx.restore();
+      }
 
       for (const i of indices) {
-        const dist = Math.abs(i - (barCount - 1) / 2);
-        const norm = half > 0 ? dist / half : 0;
-        const binIdx = Math.min(freqBins.length - 1, Math.floor(norm * (freqBins.length * 0.8)));
-        const raw = freqBins[binIdx] || 0;
-        const barH = Math.max(6, yScale(raw));
+        const normPos = i / (barCount - 1);
+        const energy = sampleBandEnergy(freqBins, normPos, bassLevel, midLevel, kickPulse);
+        const barH = Math.max(8, yScale(energy));
         const bx = xScale(i) ?? innerVizX;
         const by = innerVizY + innerVizH - barH;
-        const ratio = raw / 255;
 
-        // Multi-stop cyber gradient per bar
         const barGrad = ctx.createLinearGradient(0, innerVizY + innerVizH, 0, by);
         barGrad.addColorStop(0, palette.primary);
         barGrad.addColorStop(0.55, palette.secondary);
-        barGrad.addColorStop(1, colorScale(ratio));
+        barGrad.addColorStop(1, colorScale(energy));
 
         ctx.fillStyle = barGrad;
         ctx.fillRect(bx, by, barW, barH);
 
-        // Glowing peak cap
-        ctx.fillStyle = "#ffffff";
-        ctx.fillRect(bx, Math.max(innerVizY, by - 4), barW, 2.5);
+        ctx.fillStyle = kickPulse > 0.5 ? palette.accent : "#ffffff";
+        ctx.fillRect(bx, Math.max(innerVizY, by - 4 - kickPulse * 3), barW, 2.5);
       }
     } else if (vizMode === "oscilloscope") {
-      // D3 ScaleLinear + D3 Monotone Curve Line + Area Fill on Canvas 2D
       const samples = Array.from(timeDomainBins);
       const xScale = d3
         .scaleLinear()
@@ -503,7 +630,6 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
         .domain([0, 255])
         .range([innerVizY + innerVizH, innerVizY]);
 
-      // Glowing area beneath curve
       const areaGen = d3
         .area<number>()
         .x((_d, i) => xScale(i))
@@ -522,7 +648,6 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
       areaGen(samples);
       ctx.fill();
 
-      // Primary D3 waveform trace
       const lineGen = d3
         .line<number>()
         .x((_d, i) => xScale(i))
@@ -530,16 +655,15 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
         .curve(d3.curveMonotoneX)
         .context(ctx);
 
-      ctx.lineWidth = 3.5;
+      ctx.lineWidth = 3.5 + kickPulse * 3;
       ctx.strokeStyle = palette.primary;
       ctx.shadowColor = palette.accent;
-      ctx.shadowBlur = 14;
+      ctx.shadowBlur = 14 + kickPulse * 18;
       ctx.beginPath();
       lineGen(samples);
       ctx.stroke();
       ctx.restore();
     } else if (vizMode === "reactor") {
-      // D3 ScaleLinear + D3 LineRadial closed spline
       const rcx = innerVizX + innerVizW / 2;
       const rcy = innerVizY + innerVizH / 2;
       const maxR = Math.min(innerVizW, innerVizH) / 2 - 10;
@@ -552,9 +676,23 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
         ctx.stroke();
       }
 
+      // Kick-synced pulsing inner core
+      if (kickPulse > 0.05) {
+        ctx.save();
+        ctx.strokeStyle = palette.accent;
+        ctx.globalAlpha = 0.35 + kickPulse * 0.55;
+        ctx.lineWidth = 2 + kickPulse * 3;
+        ctx.beginPath();
+        ctx.arc(rcx, rcy, maxR * (0.18 + kickPulse * 0.22), 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+      }
+
       const points = 64;
-      const radialData = d3.range(points).map((i) => freqBins[i % 32] || 0);
-      const radiusScale = d3.scaleLinear().domain([0, 255]).range([maxR * 0.35, maxR]);
+      const radialData = d3
+        .range(points)
+        .map((i) => sampleBandEnergy(freqBins, (i % 32) / 31, bassLevel, midLevel, kickPulse) * 255);
+      const radiusScale = d3.scaleLinear().domain([0, 255]).range([maxR * 0.32, maxR]);
       const angleScale = d3.scaleLinear().domain([0, points]).range([0, Math.PI * 2]);
 
       const radialLine = d3
@@ -569,22 +707,194 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
       ctx.strokeStyle = palette.primary;
       ctx.lineWidth = 3;
       ctx.shadowColor = palette.glow;
-      ctx.shadowBlur = 12;
+      ctx.shadowBlur = 12 + kickPulse * 14;
       ctx.beginPath();
       radialLine(radialData);
       ctx.stroke();
 
-      // Inner accent ring
       ctx.strokeStyle = palette.secondary;
       ctx.lineWidth = 1.5;
       ctx.beginPath();
       radialLine(radialData.map((v) => v * 0.72));
       ctx.stroke();
       ctx.restore();
+    } else if (vizMode === "retro-leds") {
+      // Old-Fashioned Glowing Circular LED Dot-Matrix Music Lights locked to bass & kick
+      const cols = 28;
+      const rows = 12;
+      const colScale = d3
+        .scaleBand<number>()
+        .domain(d3.range(cols))
+        .range([innerVizX, innerVizX + innerVizW])
+        .paddingInner(0.22);
+      const rowScale = d3
+        .scaleBand<number>()
+        .domain(d3.range(rows))
+        .range([innerVizY + innerVizH, innerVizY])
+        .paddingInner(0.24);
+
+      const dotRadius = Math.min(colScale.bandwidth(), rowScale.bandwidth()) * (0.45 + kickPulse * 0.08);
+
+      for (let c = 0; c < cols; c++) {
+        const energy = sampleBandEnergy(freqBins, c / (cols - 1), bassLevel, midLevel, kickPulse);
+        const litRows = Math.max(1, Math.round(energy * rows));
+        const cx = (colScale(c) ?? innerVizX) + colScale.bandwidth() / 2;
+
+        for (let r = 0; r < rows; r++) {
+          const cy = (rowScale(r) ?? innerVizY) + rowScale.bandwidth() / 2;
+          const isLit = r < litRows;
+          const rowFrac = r / (rows - 1);
+
+          let dotColor = "#00f0ff";
+          if (rowFrac > 0.78) dotColor = "#ff2a51";
+          else if (rowFrac > 0.5) dotColor = "#d946ef";
+          else if (rowFrac > 0.25) dotColor = "#ffb01f";
+
+          ctx.save();
+          ctx.beginPath();
+          ctx.arc(cx, cy, dotRadius, 0, Math.PI * 2);
+          if (isLit) {
+            ctx.fillStyle = dotColor;
+            ctx.shadowColor = dotColor;
+            ctx.shadowBlur = 12 + kickPulse * 10;
+            ctx.fill();
+            // Bright bulb core
+            ctx.shadowBlur = 0;
+            ctx.fillStyle = "rgba(255, 255, 255, 0.65)";
+            ctx.beginPath();
+            ctx.arc(cx, cy, dotRadius * 0.35, 0, Math.PI * 2);
+            ctx.fill();
+          } else {
+            ctx.fillStyle = "rgba(255, 255, 255, 0.06)";
+            ctx.fill();
+          }
+          ctx.restore();
+        }
+      }
+    } else if (vizMode === "horizon-bars") {
+      // Glowing Neon Bars on 3D Reflective Perspective Grid Floor with Kick-Synced Sparks
+      const horizonY = innerVizY + innerVizH * 0.74;
+      const floorH = innerVizY + innerVizH - horizonY;
+
+      // 3D perspective floor grid
+      ctx.save();
+      ctx.strokeStyle = palette.primary;
+      ctx.globalAlpha = 0.28 + kickPulse * 0.35;
+      ctx.lineWidth = 1;
+      const vanishX = innerVizX + innerVizW / 2;
+      for (let i = -8; i <= 8; i++) {
+        ctx.beginPath();
+        ctx.moveTo(vanishX + i * 32, horizonY);
+        ctx.lineTo(vanishX + i * 115, innerVizY + innerVizH);
+        ctx.stroke();
+      }
+      for (let r = 1; r <= 4; r++) {
+        const y = horizonY + (r / 4) * floorH;
+        ctx.beginPath();
+        ctx.moveTo(innerVizX, y);
+        ctx.lineTo(innerVizX + innerVizW, y);
+        ctx.stroke();
+      }
+      ctx.restore();
+
+      // Tall glowing columns + floor reflections
+      const cols = 32;
+      const xScale = d3
+        .scaleBand<number>()
+        .domain(d3.range(cols))
+        .range([innerVizX, innerVizX + innerVizW])
+        .paddingInner(0.28);
+      const maxBarH = horizonY - innerVizY - 8;
+
+      for (let c = 0; c < cols; c++) {
+        const energy = sampleBandEnergy(freqBins, c / (cols - 1), bassLevel, midLevel, kickPulse);
+        const h = Math.max(8, energy * maxBarH);
+        const bx = xScale(c) ?? innerVizX;
+        const bw = xScale.bandwidth();
+        const by = horizonY - h;
+
+        const barGrad = ctx.createLinearGradient(0, horizonY, 0, by);
+        barGrad.addColorStop(0, "#ffffff");
+        barGrad.addColorStop(0.25, palette.primary);
+        barGrad.addColorStop(1, "#ff2a51");
+
+        ctx.save();
+        ctx.shadowColor = palette.primary;
+        ctx.shadowBlur = 16 + kickPulse * 14;
+        ctx.fillStyle = barGrad;
+        ctx.fillRect(bx, by, bw, h);
+
+        // Floor reflection
+        ctx.shadowBlur = 0;
+        ctx.globalAlpha = 0.25 + kickPulse * 0.2;
+        ctx.fillRect(bx, horizonY + 2, bw, Math.min(floorH - 4, h * 0.32));
+
+        // Floating sparks burst above bars on kicks
+        if (energy > 0.42 || kickPulse > 0.45) {
+          ctx.globalAlpha = 0.85;
+          ctx.fillStyle = "#ffd447";
+          const sparkY = by - 8 - ((nowMs * 0.06 + c * 17) % (24 + kickPulse * 18));
+          ctx.fillRect(bx + bw * 0.35, Math.max(innerVizY, sparkY), 3, 3);
+        }
+        ctx.restore();
+      }
+
+      // Bright kick-reactive horizon line
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 2 + kickPulse * 2;
+      ctx.beginPath();
+      ctx.moveTo(innerVizX, horizonY);
+      ctx.lineTo(innerVizX + innerVizW, horizonY);
+      ctx.stroke();
+    } else if (vizMode === "disco-tunnel") {
+      // 3D Retro Mirrored Multi-Color LED Block Equalizer Tunnel locked to kick & bass
+      const centerX = innerVizX + innerVizW / 2;
+      const centerY = innerVizY + innerVizH / 2;
+      const colsPerSide = 14;
+      const rows = 9;
+      const halfW = innerVizW * 0.46;
+
+      // Central light flare expands sharply on kicks
+      const flare = ctx.createRadialGradient(centerX, centerY, 4, centerX, centerY, 130 + kickPulse * 95);
+      flare.addColorStop(0, "#ffffff");
+      flare.addColorStop(0.35, palette.primary);
+      flare.addColorStop(1, "transparent");
+      ctx.fillStyle = flare;
+      ctx.fillRect(innerVizX, innerVizY, innerVizW, innerVizH);
+
+      for (const side of [-1, 1]) {
+        for (let c = 0; c < colsPerSide; c++) {
+          const depth = c / (colsPerSide - 1); // 0 = near outer edge, 1 = near center vanishing point
+          const colX = centerX + side * (36 + (1 - depth) * halfW);
+          const colW = Math.max(6, (1 - depth * 0.65) * 18);
+          const colHalfH = (1 - depth * 0.62) * (innerVizH * 0.46);
+          const energy = sampleBandEnergy(freqBins, depth, bassLevel, midLevel, kickPulse);
+          const activeBlocks = Math.max(1, Math.round(energy * rows));
+          const colColor = RETRO_BULB_PALETTE[(c + (side > 0 ? 2 : 0)) % RETRO_BULB_PALETTE.length];
+
+          for (let r = 0; r < rows; r++) {
+            const lit = r < activeBlocks;
+            const blockH = Math.max(3, (colHalfH / rows) * 0.72);
+            const stepY = (r + 0.5) * (colHalfH / rows);
+
+            ctx.fillStyle = lit ? colColor : "rgba(255, 255, 255, 0.06)";
+            if (lit) {
+              ctx.shadowColor = colColor;
+              ctx.shadowBlur = 8 + kickPulse * 10;
+            } else {
+              ctx.shadowBlur = 0;
+            }
+            // Symmetric top + bottom equalizer blocks
+            ctx.fillRect(colX - colW / 2, centerY - stepY - blockH / 2, colW, blockH);
+            ctx.fillRect(colX - colW / 2, centerY + stepY - blockH / 2, colW, blockH);
+          }
+          ctx.shadowBlur = 0;
+        }
+      }
     }
   } else {
-    // Live idle gentle cyber wave rendered with D3 line
-    const time = Date.now() * 0.002;
+    // Idle gentle cyber wave rendered with D3 line
+    const time = nowMs * 0.002;
     const idleCount = 60;
     const xScale = d3.scaleLinear().domain([0, idleCount - 1]).range([innerVizX, innerVizX + innerVizW]);
     const idleData = d3.range(idleCount).map((i) => innerVizY + innerVizH / 2 + Math.sin(i * 0.28 + time) * 14);
@@ -602,16 +912,28 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
     ctx.stroke();
   }
 
+  // Frequency Axis Scale Labels at bottom of Visualizer Box (60Hz .. 16kHz + MHz carrier)
+  const axisY = innerVizY + innerVizH + 10;
+  const freqLabels = ["60Hz", "250Hz", "1kHz", "4kHz", "8kHz", "16kHz // 108.0 MHz"];
+  const labelScale = d3.scaleLinear().domain([0, freqLabels.length - 1]).range([innerVizX, innerVizX + innerVizW]);
+  ctx.font = "11px 'Share Tech Mono', monospace";
+  ctx.fillStyle = "rgba(255, 255, 255, 0.45)";
+  freqLabels.forEach((lbl, idx) => {
+    ctx.textAlign = idx === 0 ? "left" : idx === freqLabels.length - 1 ? "right" : "center";
+    ctx.fillText(lbl, labelScale(idx), axisY);
+  });
+  ctx.textAlign = "left";
+
   // Cyber CRT Scanline Overlay inside the Visualizer Stage
   ctx.save();
   ctx.beginPath();
   ctx.rect(vizX, vizY, vizWidth, vizHeight);
   ctx.clip();
-  ctx.fillStyle = "rgba(0, 0, 0, 0.24)";
+  ctx.fillStyle = "rgba(0, 0, 0, 0.22)";
   for (let sy = vizY; sy < vizY + vizHeight; sy += 4) {
     ctx.fillRect(vizX, sy, vizWidth, 1.5);
   }
-  const sweepY = vizY + ((Date.now() * 0.08) % vizHeight);
+  const sweepY = vizY + ((nowMs * 0.08) % vizHeight);
   const sweepGrad = ctx.createLinearGradient(0, sweepY - 18, 0, sweepY + 18);
   sweepGrad.addColorStop(0, "transparent");
   sweepGrad.addColorStop(0.5, palette.bgRgba);
@@ -621,13 +943,13 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
   ctx.restore();
 
   // 5. Frequency band telemetry meters below visualizer
-  const meterY = vizY + vizHeight + 24;
+  const meterY = vizY + vizHeight + 22;
   const meterColW = (contentWidth - 40) / 3;
 
   const meters = [
-    { label: "SUB-BASS", val: bassLevel },
-    { label: "MIDRANGE", val: midLevel },
-    { label: "HIGHS / AIR", val: trebleLevel },
+    { label: "SUB-BASS (20–120Hz)", val: bassLevel },
+    { label: "MIDRANGE (120Hz–4kHz)", val: midLevel },
+    { label: "HIGHS / AIR (4–16kHz)", val: trebleLevel },
   ];
 
   meters.forEach((m, idx) => {
@@ -641,17 +963,15 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
     ctx.fillText(`${Math.round(m.val * 100)}%`, mx + meterColW, meterY);
     ctx.textAlign = "left";
 
-    // Meter bar background
     ctx.fillStyle = "rgba(255, 255, 255, 0.1)";
     ctx.fillRect(mx, meterY + 18, meterColW, 8);
 
-    // Meter bar fill
     ctx.fillStyle = palette.primary;
     ctx.fillRect(mx, meterY + 18, Math.max(4, meterColW * m.val), 8);
   });
 
   // 6. OutLawZ Bottom Branding & Watermark
-  const brandY = height - 60;
+  const brandY = height - 66;
   ctx.font = "bold 20px 'Orbitron', sans-serif";
   ctx.fillStyle = palette.primary;
   ctx.fillText("OutLawZ™", margin + 10, brandY);
@@ -662,13 +982,12 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
 
   // 7. Video Recording Live Overlay Indicator (Top Right)
   if (recording) {
-    const isFlash = Math.floor(Date.now() / 400) % 2 === 0;
+    const isFlash = Math.floor(nowMs / 400) % 2 === 0;
     const recBoxW = 280;
     const recBoxH = 46;
     const recX = width - margin - recBoxW;
-    const recY = margin + 10;
+    const recY = margin + 18;
 
-    // Glowing REC container
     ctx.fillStyle = "rgba(25, 4, 8, 0.9)";
     ctx.strokeStyle = "#ff2a51";
     ctx.lineWidth = 2;
@@ -688,7 +1007,6 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
     ctx.fillStyle = "#ff2a51";
     ctx.fillText("REC 1080P", recX + 44, recY + 14);
 
-    // Elapsed Duration
     const totalSec = Math.floor(recordElapsedMs / 1000);
     const mm = String(Math.floor(totalSec / 60)).padStart(2, "0");
     const ss = String(totalSec % 60).padStart(2, "0");
@@ -696,7 +1014,6 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
     ctx.fillStyle = "#ffffff";
     ctx.fillText(`${mm}:${ss}`, recX + 160, recY + 15);
 
-    // Captured size
     const mb = (recordBytes / (1024 * 1024)).toFixed(1);
     ctx.font = "12px 'Share Tech Mono', monospace";
     ctx.fillStyle = "rgba(255, 255, 255, 0.6)";

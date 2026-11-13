@@ -27,6 +27,18 @@ export function recordingName(stationName: string, date = new Date(), ext = "mp3
   return `${slug}-${fileStamp(date)}.${ext}`;
 }
 
+export function songFilename(trackTitle: string, date = new Date(), ext = "mp3") {
+  const clean = trackTitle
+    .replace(/[<>:"/\\|?*]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+  const base = clean || `track-${fileStamp(date)}`;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const stamp = `${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+  return `${base} [${stamp}].${ext}`;
+}
+
 export function downloadBlob(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");

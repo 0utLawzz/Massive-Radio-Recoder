@@ -186,9 +186,10 @@ export function attachAudioGraph(
   compressor.attack.value = 0.002;
   compressor.release.value = 0.15;
 
-  // Post-AGC visualizer analyser
+  // Post-AGC visualizer analyser (256 frequency bins for rich multi-band movement)
   const analyser = ctx.createAnalyser();
-  analyser.fftSize = 256;
+  analyser.fftSize = 512;
+  analyser.smoothingTimeConstant = 0.54;
 
   // Dedicated monitor gain so user volume / mute never alters the recording pipeline
   const monitorGain = ctx.createGain();

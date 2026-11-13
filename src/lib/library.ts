@@ -7,6 +7,7 @@ export type TakeMeta = {
   id: string;
   stationId: string;
   stationName: string;
+  trackTitle?: string;
   startedAt: number;
   endedAt: number;
   bytes: number;
