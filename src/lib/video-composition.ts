@@ -83,6 +83,9 @@ export type RenderCompositionOptions = {
   midLevel: number;
   trebleLevel: number;
   kickPulse?: number;
+  bpm?: number | null;
+  beatPhase?: number;
+  bpmConfidence?: number;
 };
 
 const RETRO_BULB_PALETTE = [
@@ -96,8 +99,8 @@ const RETRO_BULB_PALETTE = [
 ];
 
 /**
- * Perceptual logarithmic frequency sampler locked to bass & kick transients so
- * EVERY spectrum bar dances tightly in sync with kick drums and sub-bass energy.
+ * Perceptual logarithmic frequency sampler locked to detected BPM rhythm & bass/kick transients.
+ * Bar amplitude scaling and wave modulation respond directly to rhythmic pulses and tempo.
  */
 function sampleBandEnergy(
   freqBins: Uint8Array,
@@ -105,6 +108,8 @@ function sampleBandEnergy(
   bassLevel: number,
   midLevel: number,
   kickPulse = 0,
+  beatPhase = 0,
+  tempoScale = 1,
 ): number {
   const maxActiveBin = Math.min(freqBins.length - 1, 150); // ~0 Hz to ~14 kHz active musical range
   const curved = Math.pow(Math.max(0, Math.min(1, normPos)), 1.55);
@@ -114,11 +119,16 @@ function sampleBandEnergy(
   const next = freqBins[Math.min(maxActiveBin, centerIdx + 1)] || 0;
   const rawAvg = (prev * 0.25 + cur * 0.5 + next * 0.25) / 255;
 
-  // High-frequency perceptual boost + tight bass/kick pump so all bands jump on kick hits
+  // Rhythmic harmonic wave synced to BPM beatPhase across the bar array
+  const beatHarmonic = Math.max(0, Math.cos((beatPhase - normPos * 0.35) * Math.PI * 2));
   const trebleGain = 1 + curved * 0.65;
-  const bassDrive = bassLevel * 0.42 + kickPulse * 0.52;
-  const bandSync = rawAvg * (trebleGain + bassDrive * 0.65);
-  const kickLift = kickPulse * (0.28 - 0.1 * normPos) + bassLevel * 0.12 + midLevel * 0.06;
+  const bassDrive = bassLevel * 0.42 + kickPulse * 0.54 * tempoScale;
+  const bandSync = rawAvg * (trebleGain + bassDrive * 0.7);
+  const kickLift =
+    kickPulse * (0.28 - 0.1 * normPos) +
+    beatHarmonic * (kickPulse * 0.14 + bassLevel * 0.08) +
+    bassLevel * 0.1 +
+    midLevel * 0.05;
   return Math.min(1, bandSync + kickLift);
 }
 
@@ -148,10 +158,14 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
     midLevel,
     trebleLevel,
     kickPulse = 0,
+    bpm = null,
+    beatPhase = 0,
+    bpmConfidence = 0,
   } = opts;
 
   const palette = THEME_PALETTES[theme];
   const nowMs = Date.now();
+  const tempoScale = bpm ? Math.max(0.65, Math.min(1.6, bpm / 120)) : 1;
 
   // 1. Cyberpunk Studio Background (deep dark metallic slate with vignette)
   ctx.save();
@@ -165,7 +179,7 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
     50,
     width * 0.28,
     height * 0.5,
-    820 + (isLive ? kickPulse * 140 : 0),
+    820 + (isLive ? kickPulse * 140 * tempoScale : 0),
   );
   bgGrad.addColorStop(0, palette.bgRgba);
   bgGrad.addColorStop(1, "transparent");
@@ -187,22 +201,22 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
   }
   ctx.stroke();
 
-  // Old-Fashioned Music Lights along top & bottom studio rails
+  // Old-Fashioned Music Lights along top & bottom studio rails (chase speed locked to BPM beatPhase)
   if (musicLightsEnabled) {
     const bulbCount = 30;
     const marginX = 90;
     const stepX = (width - marginX * 2) / (bulbCount - 1);
-    const chasePhase = Math.floor(nowMs / 150);
+    const chasePhase = isLive && bpm ? Math.floor(beatPhase * 4) : Math.floor(nowMs / (150 / tempoScale));
 
     for (let i = 0; i < bulbCount; i++) {
       const bx = marginX + i * stepX;
       const bandNorm = i / (bulbCount - 1);
       const bandVal = isLive
-        ? sampleBandEnergy(freqBins, bandNorm, bassLevel, midLevel, kickPulse)
+        ? sampleBandEnergy(freqBins, bandNorm, bassLevel, midLevel, kickPulse, beatPhase, tempoScale)
         : 0.25 + 0.2 * Math.sin(nowMs * 0.004 + i * 0.5);
       const isChaseOn = (i + chasePhase) % 3 === 0;
       const intensity = isLive
-        ? Math.min(1, 0.28 + bandVal * 0.72 + kickPulse * 0.35 + (isChaseOn ? 0.12 : 0))
+        ? Math.min(1, 0.28 + bandVal * 0.72 + kickPulse * 0.35 + (isChaseOn ? 0.14 : 0))
         : isChaseOn
         ? 0.55
         : 0.2;
@@ -212,7 +226,7 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
         ctx.save();
         ctx.globalAlpha = intensity;
         ctx.shadowColor = bulbColor;
-        ctx.shadowBlur = isLive ? 14 + bassLevel * 18 + kickPulse * 24 : 8;
+        ctx.shadowBlur = isLive ? 14 + bassLevel * 18 + kickPulse * 24 * tempoScale : 8;
         ctx.fillStyle = bulbColor;
         ctx.beginPath();
         ctx.arc(bx, by, 7 + (isLive ? kickPulse * 2.5 : 0), 0, Math.PI * 2);
@@ -286,7 +300,7 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
     ctx.restore();
   }
 
-  // Radial Outer Spectrum Ring around Vinyl (inspired by circular neon spectrum reference)
+  // Radial Outer Spectrum Ring around Vinyl (BPM-synced rotation & expansion)
   if (visualizerEnabled) {
     const radialBars = 72;
     const innerRingR = vinylRadius + 14;
@@ -294,16 +308,16 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
       const angle = (i / radialBars) * Math.PI * 2 - Math.PI / 2;
       const norm = (i % (radialBars / 2)) / (radialBars / 2);
       const energy = isLive
-        ? sampleBandEnergy(freqBins, norm, bassLevel, midLevel, kickPulse)
+        ? sampleBandEnergy(freqBins, norm, bassLevel, midLevel, kickPulse, beatPhase, tempoScale)
         : 0.14 + 0.08 * Math.sin(nowMs * 0.003 + i * 0.35);
-      const len = 10 + energy * (76 + kickPulse * 34);
+      const len = 10 + energy * (76 + kickPulse * 34 * tempoScale);
 
       const x1 = Math.cos(angle) * innerRingR;
       const y1 = Math.sin(angle) * innerRingR;
       const x2 = Math.cos(angle) * (innerRingR + len);
       const y2 = Math.sin(angle) * (innerRingR + len);
 
-      const hue = ((i / radialBars) * 300 + (nowMs * 0.02)) % 360;
+      const hue = ((i / radialBars) * 300 + nowMs * 0.02 * tempoScale) % 360;
       ctx.strokeStyle = isLive ? `hsl(${hue}, 95%, 60%)` : palette.grid;
       ctx.lineWidth = 4;
       ctx.lineCap = "round";
@@ -504,17 +518,19 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
   ctx.fill();
   ctx.stroke();
 
-  // Viz Header
+  // Viz Header with Live Detected BPM
   ctx.font = "14px 'Share Tech Mono', monospace";
   ctx.fillStyle = palette.primary;
+  const bpmTag = isLive ? (bpm ? `${bpm} BPM` : "TRACKING BPM") : "STANDBY";
   const modeLabel = visualizerEnabled
-    ? `D3 SPECTRUM & KICK SYNC // MODE: ${vizMode.toUpperCase()}`
+    ? `D3 SPECTRUM // ${vizMode.toUpperCase()} // ${bpmTag}`
     : "D3 SPECTRUM MATRIX // STATIC LAYOUT";
   ctx.fillText(modeLabel, vizX + 16, vizY + 14);
 
   ctx.textAlign = "right";
   ctx.fillStyle = kickPulse > 0.45 && isLive ? palette.accent : "rgba(255, 255, 255, 0.65)";
-  ctx.fillText(`PEAK: ${opts.peakDb} // KICK SYNC ${Math.round(kickPulse * 100)}% // 60Hz–16kHz`, vizX + vizWidth - 16, vizY + 14);
+  const confText = bpm ? `LOCK ${Math.round(bpmConfidence * 100)}%` : "60Hz–16kHz";
+  ctx.fillText(`PEAK: ${opts.peakDb} // KICK SYNC ${Math.round(kickPulse * 100)}% // ${confText}`, vizX + vizWidth - 16, vizY + 14);
   ctx.textAlign = "left";
 
   const innerVizX = vizX + 16;
@@ -602,7 +618,7 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
 
       for (const i of indices) {
         const normPos = i / (barCount - 1);
-        const energy = sampleBandEnergy(freqBins, normPos, bassLevel, midLevel, kickPulse);
+        const energy = sampleBandEnergy(freqBins, normPos, bassLevel, midLevel, kickPulse, beatPhase, tempoScale);
         const barH = Math.max(8, yScale(energy));
         const bx = xScale(i) ?? innerVizX;
         const by = innerVizY + innerVizH - barH;
@@ -691,7 +707,7 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
       const points = 64;
       const radialData = d3
         .range(points)
-        .map((i) => sampleBandEnergy(freqBins, (i % 32) / 31, bassLevel, midLevel, kickPulse) * 255);
+        .map((i) => sampleBandEnergy(freqBins, (i % 32) / 31, bassLevel, midLevel, kickPulse, beatPhase, tempoScale) * 255);
       const radiusScale = d3.scaleLinear().domain([0, 255]).range([maxR * 0.32, maxR]);
       const angleScale = d3.scaleLinear().domain([0, points]).range([0, Math.PI * 2]);
 
@@ -719,7 +735,7 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
       ctx.stroke();
       ctx.restore();
     } else if (vizMode === "retro-leds") {
-      // Old-Fashioned Glowing Circular LED Dot-Matrix Music Lights locked to bass & kick
+      // Old-Fashioned Glowing Circular LED Dot-Matrix Music Lights locked to BPM & bass/kick
       const cols = 28;
       const rows = 12;
       const colScale = d3
@@ -736,7 +752,7 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
       const dotRadius = Math.min(colScale.bandwidth(), rowScale.bandwidth()) * (0.45 + kickPulse * 0.08);
 
       for (let c = 0; c < cols; c++) {
-        const energy = sampleBandEnergy(freqBins, c / (cols - 1), bassLevel, midLevel, kickPulse);
+        const energy = sampleBandEnergy(freqBins, c / (cols - 1), bassLevel, midLevel, kickPulse, beatPhase, tempoScale);
         const litRows = Math.max(1, Math.round(energy * rows));
         const cx = (colScale(c) ?? innerVizX) + colScale.bandwidth() / 2;
 
@@ -772,7 +788,7 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
         }
       }
     } else if (vizMode === "horizon-bars") {
-      // Glowing Neon Bars on 3D Reflective Perspective Grid Floor with Kick-Synced Sparks
+      // Glowing Neon Bars on 3D Reflective Perspective Grid Floor with BPM-Synced Sparks
       const horizonY = innerVizY + innerVizH * 0.74;
       const floorH = innerVizY + innerVizH - horizonY;
 
@@ -807,7 +823,7 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
       const maxBarH = horizonY - innerVizY - 8;
 
       for (let c = 0; c < cols; c++) {
-        const energy = sampleBandEnergy(freqBins, c / (cols - 1), bassLevel, midLevel, kickPulse);
+        const energy = sampleBandEnergy(freqBins, c / (cols - 1), bassLevel, midLevel, kickPulse, beatPhase, tempoScale);
         const h = Math.max(8, energy * maxBarH);
         const bx = xScale(c) ?? innerVizX;
         const bw = xScale.bandwidth();
@@ -829,11 +845,11 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
         ctx.globalAlpha = 0.25 + kickPulse * 0.2;
         ctx.fillRect(bx, horizonY + 2, bw, Math.min(floorH - 4, h * 0.32));
 
-        // Floating sparks burst above bars on kicks
+        // Floating sparks burst upward at BPM tempo speed
         if (energy > 0.42 || kickPulse > 0.45) {
           ctx.globalAlpha = 0.85;
           ctx.fillStyle = "#ffd447";
-          const sparkY = by - 8 - ((nowMs * 0.06 + c * 17) % (24 + kickPulse * 18));
+          const sparkY = by - 8 - ((nowMs * 0.06 * tempoScale + c * 17) % (24 + kickPulse * 18));
           ctx.fillRect(bx + bw * 0.35, Math.max(innerVizY, sparkY), 3, 3);
         }
         ctx.restore();
@@ -847,7 +863,7 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
       ctx.lineTo(innerVizX + innerVizW, horizonY);
       ctx.stroke();
     } else if (vizMode === "disco-tunnel") {
-      // 3D Retro Mirrored Multi-Color LED Block Equalizer Tunnel locked to kick & bass
+      // 3D Retro Mirrored Multi-Color LED Block Equalizer Tunnel locked to BPM & kick
       const centerX = innerVizX + innerVizW / 2;
       const centerY = innerVizY + innerVizH / 2;
       const colsPerSide = 14;
@@ -855,7 +871,7 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
       const halfW = innerVizW * 0.46;
 
       // Central light flare expands sharply on kicks
-      const flare = ctx.createRadialGradient(centerX, centerY, 4, centerX, centerY, 130 + kickPulse * 95);
+      const flare = ctx.createRadialGradient(centerX, centerY, 4, centerX, centerY, 130 + kickPulse * 95 * tempoScale);
       flare.addColorStop(0, "#ffffff");
       flare.addColorStop(0.35, palette.primary);
       flare.addColorStop(1, "transparent");
@@ -868,7 +884,7 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
           const colX = centerX + side * (36 + (1 - depth) * halfW);
           const colW = Math.max(6, (1 - depth * 0.65) * 18);
           const colHalfH = (1 - depth * 0.62) * (innerVizH * 0.46);
-          const energy = sampleBandEnergy(freqBins, depth, bassLevel, midLevel, kickPulse);
+          const energy = sampleBandEnergy(freqBins, depth, bassLevel, midLevel, kickPulse, beatPhase, tempoScale);
           const activeBlocks = Math.max(1, Math.round(energy * rows));
           const colColor = RETRO_BULB_PALETTE[(c + (side > 0 ? 2 : 0)) % RETRO_BULB_PALETTE.length];
 
@@ -933,7 +949,7 @@ export function renderVideoComposition(opts: RenderCompositionOptions) {
   for (let sy = vizY; sy < vizY + vizHeight; sy += 4) {
     ctx.fillRect(vizX, sy, vizWidth, 1.5);
   }
-  const sweepY = vizY + ((nowMs * 0.08) % vizHeight);
+  const sweepY = vizY + ((nowMs * 0.08 * tempoScale) % vizHeight);
   const sweepGrad = ctx.createLinearGradient(0, sweepY - 18, 0, sweepY + 18);
   sweepGrad.addColorStop(0, "transparent");
   sweepGrad.addColorStop(0.5, palette.bgRgba);

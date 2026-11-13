@@ -65,6 +65,7 @@ import {
   type AgcMode,
   type AudioGraph,
 } from "@/lib/agc";
+import { BpmDetector } from "@/lib/bpm";
 
 const LIMITS = [
   { id: "off", label: "Manual", ms: null },
@@ -354,6 +355,9 @@ export function Deck() {
   const [midLevel, setMidLevel] = useState(0.2);
   const [trebleLevel, setTrebleLevel] = useState(0.2);
   const [kickPulse, setKickPulse] = useState(0);
+  const [detectedBpm, setDetectedBpm] = useState<number | null>(null);
+  const [bpmConfidence, setBpmConfidence] = useState(0);
+  const [beatPhase, setBeatPhase] = useState(0);
   const [vizMode, setVizMode] = useState<VisualizerMode>("spectrum");
   const [agcEnabled, setAgcEnabled] = useState(true);
   const [agcMode, setAgcMode] = useState<AgcMode>("worklet");
@@ -410,8 +414,7 @@ export function Deck() {
   const vinylAngleRef = useRef(0);
   const lastFrameTimeRef = useRef(performance.now());
   const lastStateUpdateRef = useRef(0);
-  const kickEnvelopeRef = useRef(0);
-  const prevKickEnergyRef = useRef(0);
+  const bpmDetectorRef = useRef<BpmDetector | null>(null);
 
   // Hydration-safe restoration of user visual preferences from localStorage
   useEffect(() => {
@@ -881,10 +884,6 @@ export function Deck() {
 
       const isLive = Boolean(audio && !audio.paused && audio.src);
 
-      if (isLive) {
-        vinylAngleRef.current += dt * 1.8;
-      }
-
       let graph: AudioGraph | null = null;
       if (isLive && audio) {
         graph = attachAudioGraph(audio, volumeRef.current, isMutedRef.current, (mode) => {
@@ -898,28 +897,37 @@ export function Deck() {
         }
       }
 
+      if (!bpmDetectorRef.current) {
+        bpmDetectorRef.current = new BpmDetector();
+      }
+
       let curBass = 0.2;
       let curMid = 0.2;
       let curTreble = 0.2;
       let curKickPulse = 0;
+      let curBpm: number | null = null;
+      let curBpmConf = 0;
+      let curBeatPhase = 0;
       let curPeakStr = "-∞";
 
       if (graph && isLive) {
         graph.analyser.getByteFrequencyData(freqBins);
         graph.analyser.getByteTimeDomainData(timeDomainBins);
 
-        // Tight sub-bass & kick punch detection (bins 0..3 cover ~0-375Hz, heavily weighted to kick fundamentals)
+        const bpmState = bpmDetectorRef.current.update(freqBins, timeNow, dt);
+        curKickPulse = bpmState.beatPulse;
+        curBpm = bpmState.bpm;
+        curBpmConf = bpmState.confidence;
+        curBeatPhase = bpmState.beatPhase;
+
+        // Tempo-synced vinyl speed (faster BPM spins slightly brisker)
+        const tempoScale = curBpm ? Math.max(0.65, Math.min(1.6, curBpm / 120)) : 1;
+        vinylAngleRef.current += dt * 1.8 * tempoScale;
+
         const b0 = (freqBins[0] || 0) / 255;
         const b1 = (freqBins[1] || 0) / 255;
         const b2 = (freqBins[2] || 0) / 255;
-        const b3 = (freqBins[3] || 0) / 255;
-        const kickInstant = Math.min(1, b0 * 0.36 + b1 * 0.36 + b2 * 0.18 + b3 * 0.1);
-        const kickDelta = Math.max(0, kickInstant - prevKickEnergyRef.current);
-        prevKickEnergyRef.current = prevKickEnergyRef.current * 0.76 + kickInstant * 0.24;
-
-        const kickTarget = Math.min(1, kickDelta * 3.1 + Math.max(0, kickInstant - 0.32) * 1.2);
-        kickEnvelopeRef.current = Math.max(kickTarget, kickEnvelopeRef.current * Math.pow(0.012, dt));
-        curKickPulse = kickEnvelopeRef.current;
+        const kickInstant = Math.min(1, b0 * 0.4 + b1 * 0.4 + b2 * 0.2);
 
         let mSum = 0;
         let tSum = 0;
@@ -943,15 +951,27 @@ export function Deck() {
           setMidLevel(curMid);
           setTrebleLevel(curTreble);
           setKickPulse(curKickPulse);
+          setDetectedBpm(curBpm);
+          setBpmConfidence(curBpmConf);
+          setBeatPhase(curBeatPhase);
           setPeakDb(curPeakStr);
           setAgcGainDb(graph.currentGainDb);
           setAgcMode(graph.mode);
           setSampleRate(graph.ctx.sampleRate);
         }
-      } else if (kickEnvelopeRef.current > 0.005) {
-        kickEnvelopeRef.current = 0;
-        prevKickEnergyRef.current = 0;
-        setKickPulse(0);
+      } else {
+        if (isLive) {
+          vinylAngleRef.current += dt * 1.8;
+        } else {
+          bpmDetectorRef.current.reset();
+          if (timeNow - lastStateUpdateRef.current > 150) {
+            lastStateUpdateRef.current = timeNow;
+            setKickPulse(0);
+            setDetectedBpm(null);
+            setBpmConfidence(0);
+            setBeatPhase(0);
+          }
+        }
       }
 
       const parsed = parseTrackMeta(nowPlayingRef.current ?? stationRef.current?.name);
@@ -982,6 +1002,9 @@ export function Deck() {
         midLevel: curMid,
         trebleLevel: curTreble,
         kickPulse: curKickPulse,
+        bpm: curBpm,
+        beatPhase: curBeatPhase,
+        bpmConfidence: curBpmConf,
       });
 
       frame = window.requestAnimationFrame(render);
@@ -2893,7 +2916,13 @@ export function Deck() {
                         boxShadow: kickPulse > 0.25 ? `0 0 ${Math.round(6 + kickPulse * 12)}px ${themeClasses.hex}` : "none",
                       }}
                     />
-                    <span>KICK SYNC</span>
+                    <span>
+                      {detectedBpm
+                        ? `${detectedBpm} BPM (${Math.round(bpmConfidence * 100)}%)`
+                        : listening
+                        ? "TRACKING BPM..."
+                        : "BPM KICK SYNC"}
+                    </span>
                   </span>
                   {artworkLoading && (
                     <span className="text-cyan text-[11px] animate-pulse hidden sm:inline">// FETCHING ARTWORK...</span>
@@ -3065,7 +3094,8 @@ export function Deck() {
                     "#00f0ff",
                   ].map((color, idx) => {
                     const bandEnergy = idx % 3 === 0 ? bassLevel : idx % 3 === 1 ? midLevel : trebleLevel;
-                    const kickedEnergy = Math.min(1, bandEnergy * 0.65 + kickPulse * 0.55);
+                    const beatChase = listening && detectedBpm ? (idx + Math.floor(beatPhase * 4)) % 3 === 0 : false;
+                    const kickedEnergy = Math.min(1, bandEnergy * 0.65 + kickPulse * 0.55 + (beatChase ? 0.15 : 0));
                     const activeBoost = listening || recording ? 0.3 + kickedEnergy * 0.7 : 0.32;
                     return (
                       <div key={idx} className="flex flex-col items-center">
